@@ -45,9 +45,22 @@ Each ballot is a permutation of `0..num_candidates`, where `ranking[0]` is the v
 
 The `result()` method is read-only (`&self`) and deterministic, so the outcome is trustless — no trusted tally authority is needed.
 
-## STV tally algorithm (multi-winner)
+## Sequential IRV tally algorithm (multi-winner, default)
 
-For elections with multiple seats (e.g. council elections where seats are fungible), the template supports **single transferable vote (STV)** with the Droop quota:
+For elections with multiple seats (e.g. council elections where seats are fungible), the **default multi-winner method** is sequential IRV:
+
+1. Run single-winner IRV on all candidates to fill the first seat.
+2. Remove the winner from all ballots (filter them out, preserving preference order).
+3. Reindex remaining candidates to `0..N` and run IRV again to fill the next seat.
+4. Repeat until all seats are filled or no candidates remain.
+
+Sequential IRV is simpler than STV (no quotas, no surplus transfer, no fractional weights) and reuses the existing single-winner IRV logic directly. It is not proportional — a majority bloc could win all seats — but it is easy to audit and understand.
+
+Use `result_multi()` / `end_vote_multi()` when `num_winners > 1`. The logic is in a self-contained `pub mod sequential_irv` — to strip it, delete that module and remove the `result_multi` / `end_vote_multi` / `end_vote_expired_multi` methods.
+
+## STV tally algorithm (multi-winner, alternative)
+
+For those who prefer proportional representation, the template also supports **single transferable vote (STV)** with the Droop quota as an alternative multi-winner method:
 
 1. Compute the Droop quota: `floor(continuing_ballots / (num_winners + 1)) + 1`.
 2. Count each ballot's highest-ranked still-active candidate, weighted by the ballot's current fractional weight (scaled by 10000 for fixed-point precision).
@@ -55,13 +68,13 @@ For elections with multiple seats (e.g. council elections where seats are fungib
 4. If no candidate reaches the quota, eliminate the lowest-count candidate (ties broken by lowest candidate id). Their ballots transfer at full weight to their next preference.
 5. Repeat until all seats are filled or all remaining candidates fill the remaining seats.
 
-Use `result_stv()` / `end_vote_stv()` when `num_winners > 1`. The STV logic is in a self-contained `pub mod stv` — to strip multi-winner support, delete that module and remove the STV methods.
+Use `result_stv()` / `end_vote_stv()` when `num_winners > 1` and you explicitly want STV. The STV logic is in a self-contained `pub mod stv`.
 
 ## Election expiration
 
 Elections have an `expires_at_epoch` deadline set at initiation. After the deadline, no more ballots may be cast (`cast_ballot` checks `Consensus::current_epoch()`). This prevents an election from being held up indefinitely by voters who never spend their stealth ballot tokens.
 
-After expiration, `end_vote_expired()` (single-winner) or `end_vote_expired_stv()` (multi-winner) finalizes the tally with whatever ballots were actually cast.
+After expiration, `end_vote_expired()` (single-winner), `end_vote_expired_multi()` (multi-winner sequential IRV, default), or `end_vote_expired_stv()` (multi-winner STV) finalizes the tally with whatever ballots were actually cast.
 
 ## Template API
 
@@ -74,11 +87,14 @@ After expiration, `end_vote_expired()` (single-winner) or `end_vote_expired_stv(
 | `ballot_count()` | allow_all | Returns the number of ballots cast so far. |
 | `ballot_vault_balance()` | allow_all | Returns the ballot pool vault balance (cross-check: equals `ballot_count`). |
 | `result()` | allow_all | Computes the single-winner IRV result. Read-only. |
-| `result_stv()` | allow_all | Computes the multi-winner STV result. Read-only. |
+| `result_multi()` | allow_all | Computes the multi-winner sequential-IRV result (default for `num_winners > 1`). Read-only. |
+| `result_stv()` | allow_all | Computes the multi-winner STV result (alternative, proportional). Read-only. |
 | `end_vote()` | initiator-only | Ends the vote, returns final IRV result, locks further ballots. |
-| `end_vote_stv()` | initiator-only | Ends the vote, returns final STV result. |
+| `end_vote_multi()` | initiator-only | Ends the vote, returns final sequential-IRV result (default multi-winner). |
+| `end_vote_stv()` | initiator-only | Ends the vote, returns final STV result (alternative). |
 | `end_vote_expired()` | initiator-only | Finalizes an expired election with IRV result (even if not all ballots cast). |
-| `end_vote_expired_stv()` | initiator-only | Finalizes an expired election with STV result. |
+| `end_vote_expired_multi()` | initiator-only | Finalizes an expired election with sequential-IRV result (default multi-winner). |
+| `end_vote_expired_stv()` | initiator-only | Finalizes an expired election with STV result (alternative). |
 
 > **Before publishing:** set `INITIATOR_1` / `INITIATOR_2` to the `RistrettoPublicKeyBytes` of the addresses allowed to initiate/end votes, and switch the `initiate_vote` / `end_vote` access rules from `allow_all` to `initiator_rule()`. Voter confidentiality does not depend on this (ballots are identity-free regardless), but without it anyone can start or end a vote.
 
@@ -86,8 +102,8 @@ After expiration, `end_vote_expired()` (single-winner) or `end_vote_expired_stv(
 
 ```
 templates/ranked_voting/         The template (Rust → WASM)
-  src/lib.rs                     Template + pure IRV algorithm (pub mod irv) + STV (pub mod stv)
-  tests/test.rs                  Unit + adversarial in-process tests (23 tests)
+  src/lib.rs                     Template + pure IRV (pub mod irv) + STV (pub mod stv) + sequential IRV (pub mod sequential_irv)
+  tests/test.rs                  Unit + adversarial in-process tests (29 tests)
 client/integration/              3-voter end-to-end test (IRV with redistribution)
 vendor/tari-ootle/               Git submodule: fork of tari-ootle with the two-input signing fix
 ```
