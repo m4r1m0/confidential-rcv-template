@@ -91,7 +91,184 @@ pub mod irv {
     }
 }
 
-/// Confidential ranked-choice voting template (instant-runoff / IRV).
+/// Pure single-transferable-vote (STV) tally logic for multi-winner elections, isolated from the
+/// template engine so it can be unit-tested directly. Returns simple types (winners + per-round
+/// data) with no dependency on template ABI traits.
+///
+/// This module is self-contained and modular: to strip multi-winner support, delete this module
+/// and remove the dispatch in `result()`. The IRV module (`pub mod irv`) is independent.
+pub mod stv {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Scale factor for fractional vote values. STV surplus transfers require fractional votes
+    /// (a candidate's surplus is distributed proportionally to their voters' next preferences).
+    /// We use fixed-point arithmetic with this scale to stay integer-only and deterministic for
+    /// consensus. 10000 gives 4 decimal places of precision.
+    const VOTE_SCALE: u64 = 10_000;
+
+    /// One ballot's weighted vote. Each ballot starts with weight 1.0 (= VOTE_SCALE) and its
+    /// weight is reduced fractionally when its chosen candidate is elected with a surplus.
+    struct WeightedBallot {
+        ranking: Vec<u32>,
+        weight: u64,
+    }
+
+    /// Per-round data for the STV tally trace.
+    pub struct Round {
+        /// Vote counts (scaled) for each still-active candidate in this round.
+        pub counts: BTreeMap<u32, u64>,
+        /// Candidates elected in this round (reached the quota).
+        pub elected: Vec<u32>,
+        /// The candidate eliminated in this round, if any.
+        pub eliminated: Option<u32>,
+        /// The quota threshold used this round.
+        pub quota: u64,
+    }
+
+    /// Single-transferable-vote tally with the Droop quota. Each ballot is a permutation of
+    /// `0..num_candidates` ordered by preference. Returns `(winners, rounds)`.
+    ///
+    /// Algorithm:
+    /// 1. Compute the Droop quota: `floor(continuing_ballots / (num_winners + 1)) + 1`.
+    /// 2. Count each ballot's highest-ranked still-active candidate, weighted by the ballot's
+    ///    current fractional weight.
+    /// 3. Any candidate reaching the quota is elected. Their surplus votes (count - quota) are
+    ///    transferred to those ballots' next preferences, with each ballot's weight scaled by
+    ///    `surplus / count`.
+    /// 4. If no candidate reaches the quota, eliminate the lowest-count candidate (ties broken
+    ///    by lowest candidate id for determinism). Their ballots transfer at full weight to their
+    ///    next preference.
+    /// 5. Repeat until all seats are filled or all remaining candidates fill the remaining seats.
+    ///
+    /// Deterministic: all validators agree on the outcome.
+    pub fn run_stv(
+        ballots: &[Vec<u32>],
+        num_candidates: u32,
+        num_winners: u32,
+    ) -> (Vec<u32>, Vec<Round>) {
+        let mut active: BTreeSet<u32> = (0..num_candidates).collect();
+        let mut elected: Vec<u32> = Vec::new();
+        let mut rounds: Vec<Round> = Vec::new();
+
+        // Each ballot starts with full weight (1.0 in scaled fixed-point).
+        let mut weighted_ballots: Vec<WeightedBallot> = ballots
+            .iter()
+            .map(|ranking| WeightedBallot {
+                ranking: ranking.clone(),
+                weight: VOTE_SCALE,
+            })
+            .collect();
+
+        loop {
+            // All seats filled — done.
+            if elected.len() >= num_winners as usize {
+                break;
+            }
+
+            // Remaining active candidates all get seats (fewer candidates than remaining seats).
+            if active.len() <= num_winners as usize - elected.len() {
+                for &candidate in active.iter() {
+                    elected.push(candidate);
+                }
+                break;
+            }
+
+            // Count weighted votes for each active candidate.
+            let mut counts: BTreeMap<u32, u64> = active.iter().map(|&c| (c, 0u64)).collect();
+            let mut total_continuing: u64 = 0;
+            for ballot in &weighted_ballots {
+                for &candidate in &ballot.ranking {
+                    if active.contains(&candidate) {
+                        *counts.get_mut(&candidate).expect("active candidate counted") +=
+                            ballot.weight;
+                        total_continuing += ballot.weight;
+                        break;
+                    }
+                }
+            }
+
+            // Droop quota: floor(continuing / (seats + 1)) + 1, in scaled units.
+            let remaining_seats = num_winners as u64 - elected.len() as u64;
+            let quota = if total_continuing > 0 {
+                total_continuing / (remaining_seats + 1) + 1
+            } else {
+                0
+            };
+
+            // Check for candidates reaching the quota.
+            let newly_elected: Vec<u32> = active
+                .iter()
+                .copied()
+                .filter(|&candidate| counts.get(&candidate).copied().unwrap_or(0) >= quota)
+                .collect();
+
+            if !newly_elected.is_empty() {
+                // Elect all candidates who reached the quota this round.
+                for &candidate in &newly_elected {
+                    elected.push(candidate);
+                    active.remove(&candidate);
+                }
+
+                // Transfer surplus from each newly-elected candidate to those ballots' next
+                // preferences. Each ballot assigned to an elected candidate has its weight
+                // scaled by surplus / count (the transfer fraction).
+                for &candidate in &newly_elected {
+                    let candidate_count = counts.get(&candidate).copied().unwrap_or(0);
+                    if candidate_count == 0 || quota == 0 {
+                        continue;
+                    }
+                    let surplus = candidate_count - quota;
+
+                    for ballot in &mut weighted_ballots {
+                        // Find if this ballot's top active preference was the elected candidate.
+                        let top_choice = ballot.ranking.iter().copied().find(|c| {
+                            // The candidate is no longer in active (we removed them), so check
+                            // if they were the ballot's highest-ranked among the pre-removal set.
+                            // We check against the elected candidate directly.
+                            *c == candidate
+                        });
+                        if top_choice.is_some() {
+                            // Scale this ballot's weight by surplus / count.
+                            ballot.weight = ballot.weight * surplus / candidate_count;
+                        }
+                    }
+                }
+
+                rounds.push(Round {
+                    counts,
+                    elected: newly_elected,
+                    eliminated: None,
+                    quota,
+                });
+                continue;
+            }
+
+            // No candidate reached quota — eliminate the lowest-count candidate.
+            // Ties broken by lowest candidate id (BTreeSet iteration order).
+            let min_count = counts.values().min().copied().unwrap_or(0);
+            let to_eliminate = active
+                .iter()
+                .copied()
+                .find(|candidate| counts.get(candidate).copied().unwrap_or(0) == min_count)
+                .expect("an elimination candidate exists when active set is non-empty");
+
+            active.remove(&to_eliminate);
+
+            // Eliminated candidate's ballots transfer at full weight to their next preference.
+            // No weight change needed — the next count round will pick up the next preference
+            // automatically since the eliminated candidate is no longer active.
+
+            rounds.push(Round {
+                counts,
+                elected: Vec::new(),
+                eliminated: Some(to_eliminate),
+                quota,
+            });
+        }
+
+        (elected, rounds)
+    }
+}
 ///
 /// A vote instance mints one unlinkable stealth ballot-token UTXO per eligible voter (built
 /// off-chain by the initiator's wallet and passed in as a `StealthTransferStatement`). Each voter
@@ -114,6 +291,7 @@ pub mod irv {
 mod ranked_voting {
     use super::*;
     use super::irv::run_irv;
+    use super::stv::run_stv;
     use std::collections::{BTreeMap, BTreeSet};
 
     pub struct RankedVote {
@@ -124,6 +302,11 @@ mod ranked_voting {
         ballot_vault: Vault,
         ballots: Vec<Vec<u32>>,
         num_candidates: u32,
+        /// Number of winners to elect. 1 = single-winner IRV; >1 = multi-winner STV.
+        num_winners: u32,
+        /// The epoch after which no more ballots may be cast. Prevents elections from being held
+        /// up indefinitely by voters who never spend their stealth ballot tokens.
+        expires_at_epoch: u64,
         active: bool,
     }
 
@@ -144,6 +327,26 @@ mod ranked_voting {
         pub eliminated: Option<u32>,
     }
 
+    /// Result of a single-transferable-vote (multi-winner) tally.
+    pub struct StvResult {
+        /// The winning candidate ids, in the order they were elected.
+        pub winners: Vec<u32>,
+        /// Per-round tally trace.
+        pub rounds: Vec<StvRoundTally>,
+    }
+
+    /// One round of the STV tally.
+    pub struct StvRoundTally {
+        /// Vote counts (scaled) for each still-active candidate in this round.
+        pub counts: BTreeMap<u32, u64>,
+        /// Candidates elected in this round (reached the quota).
+        pub elected: Vec<u32>,
+        /// The candidate eliminated in this round, if any.
+        pub eliminated: Option<u32>,
+        /// The Droop quota threshold used this round.
+        pub quota: u64,
+    }
+
     impl RankedVote {
         /// Constructor. Creates the stealth ballot resource and the empty ballot pool. The
         /// resource address is pre-allocated by the caller so the initiator can build the mint
@@ -162,6 +365,8 @@ mod ranked_voting {
                 ballot_vault: Vault::new_empty(ballot_resource),
                 ballots: Vec::new(),
                 num_candidates: 0,
+                num_winners: 1,
+                expires_at_epoch: 0,
                 active: false,
             })
             .with_access_rules(
@@ -172,12 +377,16 @@ mod ranked_voting {
                     // voter confidentiality does not depend on this.
                     .method("initiate_vote", rule!(allow_all))
                     .method("end_vote", rule!(allow_all))
-                    // cast_ballot / result / ballot_count / resource_address are callable by
-                    // anyone; they deliberately do NOT call
+                    .method("end_vote_stv", rule!(allow_all))
+                    .method("end_vote_expired", rule!(allow_all))
+                    .method("end_vote_expired_stv", rule!(allow_all))
+                    // cast_ballot / result / result_stv / ballot_count / resource_address are
+                    // callable by anyone; they deliberately do NOT call
                     // CallerContext::transaction_signer_public_key() so that voters' transactions
                     // can be sealed with an ephemeral key (no identity).
                     .method("cast_ballot", rule!(allow_all))
                     .method("result", rule!(allow_all))
+                    .method("result_stv", rule!(allow_all))
                     .method("ballot_count", rule!(allow_all))
                     .method("ballot_vault_balance", rule!(allow_all))
                     .method("resource_address", rule!(allow_all))
@@ -196,15 +405,30 @@ mod ranked_voting {
         /// each owned by a one-time key unlinkable to the voter's real public key. The statement
         /// must carry exactly `voter_count` as its revealed input amount and one stealth output
         /// per voter (built off-chain by the initiator's wallet).
+        ///
+        /// `num_winners` sets how many seats to fill: 1 = single-winner IRV, >1 = multi-winner
+        /// STV with Droop quota and surplus transfer.
+        ///
+        /// `expires_at_epoch` sets the deadline after which no more ballots may be cast. This
+        /// prevents an election from being held up indefinitely by voters who never spend their
+        /// stealth ballot tokens. After expiration, `end_vote_expired()` may be called to
+        /// finalize the tally with whatever ballots were cast.
         pub fn initiate_vote(
             &mut self,
             voter_count: u64,
             num_candidates: u32,
+            num_winners: u32,
+            expires_at_epoch: u64,
             mint_statement: StealthTransferStatement,
         ) {
             assert!(!self.active, "A vote is already in progress");
             assert!(voter_count > 0, "voter_count must be positive");
             assert!(num_candidates > 0, "num_candidates must be positive");
+            assert!(num_winners > 0, "num_winners must be positive");
+            assert!(
+                num_winners <= num_candidates,
+                "num_winners cannot exceed num_candidates",
+            );
             assert_eq!(
                 mint_statement.revealed_input_amount(),
                 Amount::from(voter_count),
@@ -212,6 +436,8 @@ mod ranked_voting {
             );
 
             self.num_candidates = num_candidates;
+            self.num_winners = num_winners;
+            self.expires_at_epoch = expires_at_epoch;
             let manager = ResourceManager::get(self.ballot_resource);
             let minted = manager.mint_stealth(Amount::from(voter_count));
             // Convert the revealed mint into per-voter stealth UTXOs. Any revealed output (which
@@ -225,6 +451,8 @@ mod ranked_voting {
                 metadata![
                     "voter_count" => voter_count.to_string(),
                     "num_candidates" => num_candidates.to_string(),
+                    "num_winners" => num_winners.to_string(),
+                    "expires_at_epoch" => expires_at_epoch.to_string(),
                 ],
             );
         }
@@ -236,6 +464,12 @@ mod ranked_voting {
         /// sealed with an ephemeral one-time key (no voter identity).
         pub fn cast_ballot(&mut self, bucket: Bucket, ranking: Vec<u32>) {
             assert!(self.active, "No active vote");
+            let current_epoch = Consensus::current_epoch();
+            assert!(
+                current_epoch <= self.expires_at_epoch,
+                "Voting period has expired (current epoch {current_epoch}, deadline {})",
+                self.expires_at_epoch,
+            );
             assert_eq!(
                 bucket.resource_address(),
                 self.ballot_resource,
@@ -265,47 +499,134 @@ mod ranked_voting {
             self.ballot_vault.balance()
         }
 
-        /// Compute the instant-runoff result over all cast ballots. Read-only and deterministic,
-        /// so the outcome is trustless. Returns the winner (if any) and the per-round tally.
+        /// Compute the single-winner instant-runoff result. Use when `num_winners == 1`.
+        /// Read-only and deterministic. Returns the winner (if any) and the per-round tally.
         pub fn result(&self) -> IrvResult {
             let (winner, rounds) = run_irv(&self.ballots, self.num_candidates);
             let rounds: Vec<RoundTally> = rounds
                 .into_iter()
-                .map(|r| RoundTally {
-                    counts: r.counts,
-                    eliminated: r.eliminated,
+                .map(|round| RoundTally {
+                    counts: round.counts,
+                    eliminated: round.eliminated,
                 })
                 .collect();
-            let res = IrvResult { winner, rounds };
+            let result = IrvResult { winner, rounds };
             emit_event(
                 "Result",
                 metadata![
-                    "winner" => match res.winner {
+                    "winner" => match result.winner {
                         Some(w) => w.to_string(),
                         None => "none".to_string(),
                     },
-                    "rounds" => res.rounds.len().to_string(),
+                    "rounds" => result.rounds.len().to_string(),
                 ],
             );
-            res
+            result
+        }
+
+        /// Compute the multi-winner STV result. Use when `num_winners > 1`.
+        /// Read-only and deterministic. Returns the winners (in election order) and per-round
+        /// tally.
+        pub fn result_stv(&self) -> StvResult {
+            let (winners, rounds) =
+                run_stv(&self.ballots, self.num_candidates, self.num_winners);
+            let rounds: Vec<StvRoundTally> = rounds
+                .into_iter()
+                .map(|round| StvRoundTally {
+                    counts: round.counts,
+                    elected: round.elected,
+                    eliminated: round.eliminated,
+                    quota: round.quota,
+                })
+                .collect();
+            let result = StvResult { winners, rounds };
+            emit_event(
+                "ResultStv",
+                metadata![
+                    "winners" => format!("{:?}", result.winners),
+                    "rounds" => result.rounds.len().to_string(),
+                ],
+            );
+            result
         }
 
         /// End the vote (initiator-only). Locks the vote against further ballots and returns the
-        /// final result.
+        /// final single-winner result. Use when `num_winners == 1`.
         pub fn end_vote(&mut self) -> IrvResult {
             assert!(self.active, "No active vote");
             self.active = false;
-            let res = self.result();
+            let result = self.result();
             emit_event(
                 "VoteEnded",
                 metadata![
-                    "winner" => match res.winner {
+                    "winner" => match result.winner {
                         Some(w) => w.to_string(),
                         None => "none".to_string(),
                     },
                 ],
             );
-            res
+            result
+        }
+
+        /// End the vote with a multi-winner STV result. Use when `num_winners > 1`.
+        pub fn end_vote_stv(&mut self) -> StvResult {
+            assert!(self.active, "No active vote");
+            self.active = false;
+            let result = self.result_stv();
+            emit_event(
+                "VoteEnded",
+                metadata!["winners" => format!("{:?}", result.winners)],
+            );
+            result
+        }
+
+        /// End the vote after the voting period has expired, even if not all eligible voters cast
+        /// ballots. This prevents an election from being held up indefinitely by non-voting
+        /// participants. The tally is computed with whatever ballots were actually cast.
+        ///
+        /// Returns the single-winner IRV result. For multi-winner, use `end_vote_expired_stv()`.
+        pub fn end_vote_expired(&mut self) -> IrvResult {
+            assert!(self.active, "No active vote");
+            let current_epoch = Consensus::current_epoch();
+            assert!(
+                current_epoch > self.expires_at_epoch,
+                "Voting period has not yet expired (current epoch {current_epoch}, deadline {})",
+                self.expires_at_epoch,
+            );
+            self.active = false;
+            let result = self.result();
+            emit_event(
+                "VoteEndedExpired",
+                metadata![
+                    "winner" => match result.winner {
+                        Some(w) => w.to_string(),
+                        None => "none".to_string(),
+                    },
+                    "ballots_cast" => self.ballots.len().to_string(),
+                ],
+            );
+            result
+        }
+
+        /// End an expired multi-winner election with an STV result.
+        pub fn end_vote_expired_stv(&mut self) -> StvResult {
+            assert!(self.active, "No active vote");
+            let current_epoch = Consensus::current_epoch();
+            assert!(
+                current_epoch > self.expires_at_epoch,
+                "Voting period has not yet expired (current epoch {current_epoch}, deadline {})",
+                self.expires_at_epoch,
+            );
+            self.active = false;
+            let result = self.result_stv();
+            emit_event(
+                "VoteEndedExpired",
+                metadata![
+                    "winners" => format!("{:?}", result.winners),
+                    "ballots_cast" => self.ballots.len().to_string(),
+                ],
+            );
+            result
         }
 
         /// Asserts `ranking` is a valid permutation of `0..num_candidates`.
