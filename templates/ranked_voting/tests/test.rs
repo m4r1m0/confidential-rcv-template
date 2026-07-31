@@ -1,5 +1,6 @@
 use ranked_voting::irv::run_irv;
 use ranked_voting::stv::run_stv;
+use ranked_voting::sequential_irv::run_sequential_irv;
 use tari_template_lib::prelude::{Consensus, Amount};
 use tari_template_lib::types::constants::TARI_TOKEN;
 use tari_template_test_tooling::TemplateTest;
@@ -238,6 +239,147 @@ fn test_stv_determinism() {
     let (winners2, rounds2) = run_stv(&ballots, 4, 2);
     assert_eq!(winners1, winners2);
     assert_eq!(rounds1.len(), rounds2.len());
+}
+
+// ─────────────────── Sequential IRV unit tests ───────────────────
+
+#[test]
+fn test_sequential_irv_two_winners() {
+    // 4 candidates, 2 seats, 5 voters.
+    //   Voters 1-3: [0, 1, 2, 3]
+    //   Voter 4: [1, 0, 2, 3]
+    //   Voter 5: [2, 0, 1, 3]
+    // Seat 1: IRV on all 4 candidates. 0 gets 3/5 = 60% > 50% → winner = 0.
+    // Seat 2: Remove 0 from ballots. Ballots become [1,2,3], [1,2,3], [1,2,3], [1,2,3], [2,1,3].
+    //   Reindexed: candidates 1,2,3 → 0,1,2. Ballots: [0,1,2]*4, [1,0,2].
+    //   IRV: 0 gets 4/5 = 80% > 50% → winner = reindexed 0 = original 1.
+    // Winners: [0, 1]
+    let ballots = vec![
+        ballot(&[0, 1, 2, 3]),
+        ballot(&[0, 1, 2, 3]),
+        ballot(&[0, 1, 2, 3]),
+        ballot(&[1, 0, 2, 3]),
+        ballot(&[2, 0, 1, 3]),
+    ];
+    let (winners, seats) = run_sequential_irv(&ballots, 4, 2);
+    assert_eq!(winners.len(), 2);
+    assert_eq!(winners[0], 0);
+    assert_eq!(winners[1], 1);
+    assert_eq!(seats.len(), 2);
+    // First seat should have IRV sub-rounds (decided in round 1)
+    assert_eq!(seats[0].winner, Some(0));
+    assert!(!seats[0].irv_rounds.is_empty());
+}
+
+#[test]
+fn test_sequential_irv_winner_removed_from_ballots() {
+    // Verify that the winner of seat 1 is not available for seat 2.
+    // 3 candidates, 2 seats, 3 voters.
+    //   Voter 1: [0, 1, 2]
+    //   Voter 2: [0, 2, 1]
+    //   Voter 3: [1, 0, 2]
+    // Seat 1: 0 gets 2/3 = 67% > 50% → winner = 0.
+    // Seat 2: Remove 0. Ballots: [1,2], [2,1], [1,2].
+    //   Reindexed: 1,2 → 0,1. Ballots: [0,1], [1,0], [0,1].
+    //   IRV: 0 gets 2/3 = 67% → winner = reindexed 0 = original 1.
+    // Winners: [0, 1]. Candidate 0 does NOT appear again.
+    let ballots = vec![
+        ballot(&[0, 1, 2]),
+        ballot(&[0, 2, 1]),
+        ballot(&[1, 0, 2]),
+    ];
+    let (winners, _) = run_sequential_irv(&ballots, 3, 2);
+    assert_eq!(winners, vec![0, 1]);
+    // 0 should appear exactly once
+    assert_eq!(winners.iter().filter(|&&w| w == 0).count(), 1);
+}
+
+#[test]
+fn test_sequential_irv_more_seats_than_candidates() {
+    // 2 candidates, 3 seats. Only 2 can be elected.
+    //   Voter 1: [0, 1]
+    //   Voter 2: [0, 1]
+    //   Voter 3: [1, 0]
+    // Seat 1: 0 gets 2/3 = 67% → winner = 0.
+    // Seat 2: Remove 0. Ballots: [1], [1], [1]. Only candidate 1 remains → winner = 1.
+    // Seat 3: No candidates remain → winner = None.
+    let ballots = vec![
+        ballot(&[0, 1]),
+        ballot(&[0, 1]),
+        ballot(&[1, 0]),
+    ];
+    let (winners, seats) = run_sequential_irv(&ballots, 2, 3);
+    assert_eq!(winners.len(), 2);
+    assert!(winners.contains(&0));
+    assert!(winners.contains(&1));
+    // Third seat should have no winner
+    assert_eq!(seats[2].winner, None);
+}
+
+#[test]
+fn test_sequential_irv_single_winner_matches_irv() {
+    // With 1 winner, sequential IRV should produce the same result as plain IRV.
+    let ballots = vec![
+        ballot(&[0, 2, 1]),
+        ballot(&[0, 2, 1]),
+        ballot(&[1, 2, 0]),
+        ballot(&[2, 1, 0]),
+    ];
+    let (irv_winner, _) = run_irv(&ballots, 3);
+    let (seq_winners, _) = run_sequential_irv(&ballots, 3, 1);
+    assert_eq!(seq_winners.len(), 1);
+    assert_eq!(Some(seq_winners[0]), irv_winner);
+}
+
+#[test]
+fn test_sequential_irv_determinism() {
+    let ballots = vec![
+        ballot(&[1, 0, 2, 3]),
+        ballot(&[2, 1, 0, 3]),
+        ballot(&[0, 2, 1, 3]),
+        ballot(&[3, 0, 1, 2]),
+        ballot(&[1, 2, 3, 0]),
+    ];
+    let (winners1, seats1) = run_sequential_irv(&ballots, 4, 2);
+    let (winners2, seats2) = run_sequential_irv(&ballots, 4, 2);
+    assert_eq!(winners1, winners2);
+    assert_eq!(seats1.len(), seats2.len());
+    for (seat_a, seat_b) in seats1.iter().zip(seats2.iter()) {
+        assert_eq!(seat_a.winner, seat_b.winner);
+        assert_eq!(seat_a.irv_rounds.len(), seat_b.irv_rounds.len());
+    }
+}
+
+#[test]
+fn test_sequential_irv_redistribution_between_seats() {
+    // Verify that elimination rounds in seat 1 redistribute votes that affect seat 2.
+    // 4 candidates, 2 seats, 6 voters.
+    //   Voters 1-2: [0, 3, 1, 2]
+    //   Voters 3-4: [1, 3, 0, 2]
+    //   Voter 5: [2, 3, 0, 1]
+    //   Voter 6: [3, 0, 1, 2]
+    // Seat 1: 0=2, 1=2, 2=1, 3=1. No majority. Eliminate 2 (lowest count among tied 2,3 → 2 is lower id).
+    //   Voter 5's ballot redistributes to 3. Now 0=2, 1=2, 3=2. No majority.
+    //   Eliminate 0 (lowest id among tied). Voters 1-2 redistribute to 3. Now 1=2, 3=4.
+    //   3 has 4/6 = 67% > 50% → winner = 3.
+    // Seat 2: Remove 3 from all ballots. Ballots: [0,1,2], [0,1,2], [1,0,2], [1,0,2], [2,0,1], [0,1,2].
+    //   Reindexed: 0,1,2 → 0,1,2. 0=3, 1=2, 2=1. 3/6 = 50%, not > 50%.
+    //   Eliminate 2 (lowest). Voter 5 redistributes to 0. 0=4, 1=2. 4/6 = 67% → winner = 0.
+    // Winners: [3, 0]
+    let ballots = vec![
+        ballot(&[0, 3, 1, 2]),
+        ballot(&[0, 3, 1, 2]),
+        ballot(&[1, 3, 0, 2]),
+        ballot(&[1, 3, 0, 2]),
+        ballot(&[2, 3, 0, 1]),
+        ballot(&[3, 0, 1, 2]),
+    ];
+    let (winners, seats) = run_sequential_irv(&ballots, 4, 2);
+    assert_eq!(winners.len(), 2);
+    assert_eq!(winners[0], 3);
+    assert_eq!(winners[1], 0);
+    // Seat 1 should have multiple IRV rounds (redistribution happened)
+    assert!(seats[0].irv_rounds.len() > 1);
 }
 
 // ───────────────────── Adversarial in-process tests ─────────────────────
