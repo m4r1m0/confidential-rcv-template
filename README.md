@@ -32,9 +32,9 @@ Each voter receives exactly one indivisible amount-1 stealth token. A stealth UT
 
 For a ballot to be truly unlinkable, the transaction fee must also be paid unlinkably. Each voter converts revealed TARI into a stealth TARI UTXO first, then pays the ballot transaction's fee from that stealth UTXO (with change returned to another stealth UTXO). If the fee were paid from a revealed account instead, the transaction would be linkable to the account owner.
 
-## IRV tally algorithm
+## IRV tally algorithm (single-winner)
 
-The tally uses **instant-runoff voting (IRV)**:
+The single-winner tally uses **instant-runoff voting (IRV)**:
 
 1. Count each ballot's highest-ranked **still-active** candidate as a vote for that candidate.
 2. If any candidate has **strictly more than 50%** of the continuing ballots, they win.
@@ -45,18 +45,40 @@ Each ballot is a permutation of `0..num_candidates`, where `ranking[0]` is the v
 
 The `result()` method is read-only (`&self`) and deterministic, so the outcome is trustless — no trusted tally authority is needed.
 
+## STV tally algorithm (multi-winner)
+
+For elections with multiple seats (e.g. council elections where seats are fungible), the template supports **single transferable vote (STV)** with the Droop quota:
+
+1. Compute the Droop quota: `floor(continuing_ballots / (num_winners + 1)) + 1`.
+2. Count each ballot's highest-ranked still-active candidate, weighted by the ballot's current fractional weight (scaled by 10000 for fixed-point precision).
+3. Any candidate reaching the quota is elected. Their surplus votes are transferred to those ballots' next preferences, with each ballot's weight scaled by `surplus / count`.
+4. If no candidate reaches the quota, eliminate the lowest-count candidate (ties broken by lowest candidate id). Their ballots transfer at full weight to their next preference.
+5. Repeat until all seats are filled or all remaining candidates fill the remaining seats.
+
+Use `result_stv()` / `end_vote_stv()` when `num_winners > 1`. The STV logic is in a self-contained `pub mod stv` — to strip multi-winner support, delete that module and remove the STV methods.
+
+## Election expiration
+
+Elections have an `expires_at_epoch` deadline set at initiation. After the deadline, no more ballots may be cast (`cast_ballot` checks `Consensus::current_epoch()`). This prevents an election from being held up indefinitely by voters who never spend their stealth ballot tokens.
+
+After expiration, `end_vote_expired()` (single-winner) or `end_vote_expired_stv()` (multi-winner) finalizes the tally with whatever ballots were actually cast.
+
 ## Template API
 
 | Method | Access | Description |
 |---|---|---|
-| `new(alloc)` | — | Constructor. Creates the stealth ballot resource and empty ballot pool. Pre-allocates the resource address so the initiator can build the mint statement. |
+| `new(alloc)` | — | Constructor. Creates the stealth ballot resource and empty ballot pool. Pre-allocates the resource address. |
 | `resource_address()` | allow_all | Returns the ballot-token resource address. |
-| `initiate_vote(voter_count, num_candidates, mint_statement)` | initiator-only | Mints `voter_count` revealed tokens and converts them into per-voter stealth UTXOs per the statement. Starts the vote. |
-| `cast_ballot(bucket, ranking)` | allow_all | Deposits a revealed ballot-token bucket and records the voter's full ranking. Identity-free (no `CallerContext` call). |
+| `initiate_vote(voter_count, num_candidates, num_winners, expires_at_epoch, mint_statement)` | initiator-only | Mints per-voter stealth ballot UTXOs. Starts the vote. `num_winners=1` → IRV, `>1` → STV. |
+| `cast_ballot(bucket, ranking)` | allow_all | Deposits one token + records a full ranking. Identity-free. Rejects after expiration. |
 | `ballot_count()` | allow_all | Returns the number of ballots cast so far. |
 | `ballot_vault_balance()` | allow_all | Returns the ballot pool vault balance (cross-check: equals `ballot_count`). |
-| `result()` | allow_all | Computes the IRV result over all cast ballots. Returns winner + per-round tally. Read-only. |
-| `end_vote()` | initiator-only | Ends the vote, returns final result, locks further ballots. |
+| `result()` | allow_all | Computes the single-winner IRV result. Read-only. |
+| `result_stv()` | allow_all | Computes the multi-winner STV result. Read-only. |
+| `end_vote()` | initiator-only | Ends the vote, returns final IRV result, locks further ballots. |
+| `end_vote_stv()` | initiator-only | Ends the vote, returns final STV result. |
+| `end_vote_expired()` | initiator-only | Finalizes an expired election with IRV result (even if not all ballots cast). |
+| `end_vote_expired_stv()` | initiator-only | Finalizes an expired election with STV result. |
 
 > **Before publishing:** set `INITIATOR_1` / `INITIATOR_2` to the `RistrettoPublicKeyBytes` of the addresses allowed to initiate/end votes, and switch the `initiate_vote` / `end_vote` access rules from `allow_all` to `initiator_rule()`. Voter confidentiality does not depend on this (ballots are identity-free regardless), but without it anyone can start or end a vote.
 
@@ -64,8 +86,8 @@ The `result()` method is read-only (`&self`) and deterministic, so the outcome i
 
 ```
 templates/ranked_voting/         The template (Rust → WASM)
-  src/lib.rs                     Template + pure IRV algorithm (pub mod irv)
-  tests/test.rs                  Unit tests for the IRV algorithm (10 tests)
+  src/lib.rs                     Template + pure IRV algorithm (pub mod irv) + STV (pub mod stv)
+  tests/test.rs                  Unit + adversarial in-process tests (23 tests)
 client/integration/              3-voter end-to-end test (IRV with redistribution)
 vendor/tari-ootle/               Git submodule: fork of tari-ootle with the two-input signing fix
 ```
