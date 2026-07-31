@@ -1,5 +1,6 @@
 [workspace]
 members = ["templates/ranked_voting", "client/integration"]
+exclude = ["vendor/tari-ootle"]
 resolver = "2"
 
 [profile.release]
@@ -21,3 +22,19 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.cranelift-entity]
 opt-level = 2
+
+# Override ootle-rs with our fork that fixes the two-stealth-input signing bug
+# (auth signatures bound to P_seal instead of account key K).
+# Upstream PR: https://github.com/tari-project/tari-ootle/pull/2390
+# Remove this patch section once the fix is merged upstream.
+[patch.crates-io]
+ootle-rs = { path = "vendor/tari-ootle/crates/wallet/ootle-rs" }
+ootle_byte_type = { path = "vendor/tari-ootle/crates/ootle_byte_type" }
+tari_ootle_transaction = { path = "vendor/tari-ootle/crates/transaction" }
+tari_ootle_wallet_crypto = { path = "vendor/tari-ootle/crates/wallet/crypto" }
+tari_ootle_common_types = { path = "vendor/tari-ootle/crates/common_types" }
+tari_engine_types = { path = "vendor/tari-ootle/crates/engine_types" }
+tari_template_lib = { path = "vendor/tari-ootle/crates/template_lib" }
+tari_template_lib_types = { path = "vendor/tari-ootle/crates/template_lib_types" }
+tari_template_builtin = { path = "vendor/tari-ootle/crates/template_builtin" }
+tari_template_test_tooling = { path = "vendor/tari-ootle/crates/template_test_tooling" }
