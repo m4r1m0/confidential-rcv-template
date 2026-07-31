@@ -482,10 +482,47 @@ mod ranked_voting {
     }
 
     impl RankedVote {
-        /// Constructor. Creates the stealth ballot resource and the empty ballot pool. The
-        /// resource address is pre-allocated by the caller so the initiator can build the mint
-        /// `StealthTransferStatement` (which references it) before this call finalizes.
-        pub fn new(alloc: ResourceAddressAllocation) -> Component<Self> {
+        /// Constructor — creates the component, the stealth ballot resource, and starts the vote
+        /// in a single transaction.
+        ///
+        /// # Parameters
+        ///
+        /// - `alloc`: Pre-allocated resource address. The caller allocates this before the
+        ///   transaction so the `mint_statement` can reference it. The resource is created inside
+        ///   this call with `with_address_allocation(alloc)`.
+        /// - `voter_count`: Number of eligible voters. One stealth ballot UTXO is minted per
+        ///   voter.
+        /// - `num_candidates`: Number of candidates. Each ballot must be a permutation of
+        ///   `0..num_candidates`.
+        /// - `num_winners`: Number of seats to fill. 1 = single-winner IRV, >1 = multi-winner
+        ///   STV with Droop quota and surplus transfer.
+        /// - `expires_at_epoch`: Deadline after which no more ballots may be cast. Prevents
+        ///   elections from being held up indefinitely by voters who never spend their stealth
+        ///   ballot tokens. After expiration, `end_vote_expired()` (or `end_vote_expired_stv()`)
+        ///   finalizes the tally with whatever ballots were cast.
+        /// - `mint_statement`: Built off-chain by the initiator's wallet. Must carry exactly
+        ///   `voter_count` as its revealed input amount and one stealth output per voter.
+        pub fn new(
+            alloc: ResourceAddressAllocation,
+            voter_count: u64,
+            num_candidates: u32,
+            num_winners: u32,
+            expires_at_epoch: u64,
+            mint_statement: StealthTransferStatement,
+        ) -> Component<Self> {
+            assert!(voter_count > 0, "voter_count must be positive");
+            assert!(num_candidates > 0, "num_candidates must be positive");
+            assert!(num_winners > 0, "num_winners must be positive");
+            assert!(
+                num_winners <= num_candidates,
+                "num_winners cannot exceed num_candidates",
+            );
+            assert_eq!(
+                mint_statement.revealed_input_amount(),
+                Amount::from(voter_count),
+                "mint statement revealed input must equal voter_count",
+            );
+
             let ballot_resource = ResourceBuilder::stealth()
                 .with_token_symbol("RVOTE")
                 .with_divisibility(0)
@@ -494,14 +531,22 @@ mod ranked_voting {
                 .with_address_allocation(alloc)
                 .build();
 
+            // Mint voter_count revealed tokens and convert them into per-voter stealth UTXOs
+            // via the caller-provided mint statement. Any revealed output (which there should
+            // not be) is dropped — the mint is fully converted to stealth outputs.
+            let manager = ResourceManager::get(ballot_resource);
+            let minted = manager.mint_stealth(Amount::from(voter_count));
+            let _revealed_out = manager
+                .stealth_transfer_with_opt_input_bucket(mint_statement, Some(minted));
+
             Component::new(Self {
                 ballot_resource,
                 ballot_vault: Vault::new_empty(ballot_resource),
                 ballots: Vec::new(),
-                num_candidates: 0,
-                num_winners: 1,
-                expires_at_epoch: 0,
-                active: false,
+                num_candidates,
+                num_winners,
+                expires_at_epoch,
+                active: true,
             })
             .with_access_rules(
                 AccessRules::new()
@@ -509,7 +554,6 @@ mod ranked_voting {
                     // real initiator public keys are set in INITIATOR_1/INITIATOR_2 above. Kept
                     // allow_all here so the integration test (random wallets) can drive the flow;
                     // voter confidentiality does not depend on this.
-                    .method("initiate_vote", rule!(allow_all))
                     .method("end_vote", rule!(allow_all))
                     .method("end_vote_stv", rule!(allow_all))
                     .method("end_vote_multi", rule!(allow_all))
@@ -535,63 +579,6 @@ mod ranked_voting {
         /// The ballot-token resource address (so the initiator can build outputs for it).
         pub fn resource_address(&self) -> ResourceAddress {
             self.ballot_resource
-        }
-
-        /// Start a vote. `voter_count` revealed tokens are minted and converted, via the
-        /// caller-provided `mint_statement`, into `voter_count` stealth UTXOs — one per voter,
-        /// each owned by a one-time key unlinkable to the voter's real public key. The statement
-        /// must carry exactly `voter_count` as its revealed input amount and one stealth output
-        /// per voter (built off-chain by the initiator's wallet).
-        ///
-        /// `num_winners` sets how many seats to fill: 1 = single-winner IRV, >1 = multi-winner
-        /// STV with Droop quota and surplus transfer.
-        ///
-        /// `expires_at_epoch` sets the deadline after which no more ballots may be cast. This
-        /// prevents an election from being held up indefinitely by voters who never spend their
-        /// stealth ballot tokens. After expiration, `end_vote_expired()` may be called to
-        /// finalize the tally with whatever ballots were cast.
-        pub fn initiate_vote(
-            &mut self,
-            voter_count: u64,
-            num_candidates: u32,
-            num_winners: u32,
-            expires_at_epoch: u64,
-            mint_statement: StealthTransferStatement,
-        ) {
-            assert!(!self.active, "A vote is already in progress");
-            assert!(voter_count > 0, "voter_count must be positive");
-            assert!(num_candidates > 0, "num_candidates must be positive");
-            assert!(num_winners > 0, "num_winners must be positive");
-            assert!(
-                num_winners <= num_candidates,
-                "num_winners cannot exceed num_candidates",
-            );
-            assert_eq!(
-                mint_statement.revealed_input_amount(),
-                Amount::from(voter_count),
-                "mint statement revealed input must equal voter_count",
-            );
-
-            self.num_candidates = num_candidates;
-            self.num_winners = num_winners;
-            self.expires_at_epoch = expires_at_epoch;
-            let manager = ResourceManager::get(self.ballot_resource);
-            let minted = manager.mint_stealth(Amount::from(voter_count));
-            // Convert the revealed mint into per-voter stealth UTXOs. Any revealed output (which
-            // there should not be) is dropped — the mint is fully converted to stealth outputs.
-            let _revealed_out = manager
-                .stealth_transfer_with_opt_input_bucket(mint_statement, Some(minted));
-
-            self.active = true;
-            emit_event(
-                "VoteStarted",
-                metadata![
-                    "voter_count" => voter_count.to_string(),
-                    "num_candidates" => num_candidates.to_string(),
-                    "num_winners" => num_winners.to_string(),
-                    "expires_at_epoch" => expires_at_epoch.to_string(),
-                ],
-            );
         }
 
         /// Deposit a revealed ballot-token bucket and record the voter's full ranking. `ranking`

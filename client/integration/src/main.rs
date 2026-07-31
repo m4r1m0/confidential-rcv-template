@@ -111,60 +111,37 @@ async fn publish_template(provider: &mut Provider) -> Result<TemplateAddress> {
     Ok(template_address)
 }
 
-async fn create_vote_component(
+async fn create_and_initiate_vote(
     provider: &mut Provider,
     template_address: TemplateAddress,
-) -> Result<(ComponentAddress, ResourceAddress)> {
-    print!("\n[Create] component... ");
-    let unsigned = IComponent::new(provider)
-        .then(|builder| builder.allocate_resource_address("ballot_res"))
-        .call_function(template_address, "new", args![Workspace("ballot_res")])
-        .pay_fee(50_000u64)
-        .prepare()
-        .await?;
-    let tx = TransactionRequest::default()
-        .with_transaction(unsigned)
-        .build(provider.wallet())
-        .await?;
-    let pending = provider.send_transaction(tx).await?;
-    wait_for_commit(&pending, "create").await?;
-    let receipt = pending.get_receipt().await?;
-    let component = receipt
-        .diff_summary
-        .upped
-        .iter()
-        .find_map(|s| s.substate_id.as_component_address())
-        .context("no component addr")?;
-    let ballot_resource = receipt
-        .diff_summary
-        .upped
-        .iter()
-        .find_map(|s| s.substate_id.as_resource_address().filter(|a| *a != TARI_TOKEN))
-        .context("no resource addr")?;
-    println!("  component: {component}\n  ballot resource: {ballot_resource}");
-    Ok((component, ballot_resource))
-}
-
-async fn initiate_vote(
-    provider: &mut Provider,
-    component: ComponentAddress,
     voter_addresses: &[Address],
-    ballot_resource: ResourceAddress,
-) -> Result<Vec<(PedersenCommitmentBytes, RistrettoPublicKey)>> {
-    print!("\n[Initiate] vote... ");
+) -> Result<(ComponentAddress, ResourceAddress, Vec<(PedersenCommitmentBytes, RistrettoPublicKey)>)> {
+    print!("\n[Create + Initiate] vote... ");
     let voter_count = voter_addresses.len() as u64;
 
+    // Build the mint statement: one stealth ballot UTXO (amount-1) per voter.
+    //
+    // The StealthTransfer builder requires a ResourceAddress to construct, but the resulting
+    // StealthTransferStatement does NOT embed it — the resource address is only used for
+    // resolving stealth inputs (which we don't have; this is a revealed-input mint). So we pass
+    // a placeholder address here. The real resource address is bound when the engine executes
+    // the stealth_transfer instruction inside the template's `new()` constructor, which
+    // receives the allocated address via the ResourceAddressAllocation parameter.
+    let placeholder_resource = ResourceAddress::from_hex("0000000000000000000000000000000000000000000000000000000000000000")
+        .expect("valid placeholder resource address");
     let mut mint_builder =
-        StealthTransfer::new(ballot_resource, provider).spend_revealed_input(voter_count);
+        StealthTransfer::new(placeholder_resource, provider).spend_revealed_input(voter_count);
     for address in voter_addresses {
         mint_builder = mint_builder.to_stealth_output(Output::new(
             address.clone(),
-            ballot_resource,
+            placeholder_resource,
             NonZeroU64::new(1).expect("non-zero"),
         ));
     }
     let (mint_statement, _) = mint_builder.prepare().await?;
 
+    // Capture each voter's (commitment, nonce) from the mint statement so voters can
+    // spend their UTXOs later.
     let ballot_utxos: Vec<(PedersenCommitmentBytes, RistrettoPublicKey)> = mint_statement
         .stealth_outputs()
         .iter()
@@ -179,11 +156,14 @@ async fn initiate_vote(
         })
         .collect();
 
+    // Create the component and start the vote in a single transaction.
     let unsigned = IComponent::new(provider)
-        .call_method(
-            component,
-            "initiate_vote",
+        .then(|builder| builder.allocate_resource_address("ballot_res"))
+        .call_function(
+            template_address,
+            "new",
             args![
+                Workspace("ballot_res"),
                 voter_count,
                 NUM_CANDIDATES,
                 NUM_WINNERS,
@@ -198,8 +178,23 @@ async fn initiate_vote(
         .with_transaction(unsigned)
         .build(provider.wallet())
         .await?;
-    wait_for_commit(&provider.send_transaction(tx).await?, "initiate_vote").await?;
-    Ok(ballot_utxos)
+    let pending = provider.send_transaction(tx).await?;
+    wait_for_commit(&pending, "create + initiate").await?;
+    let receipt = pending.get_receipt().await?;
+    let component = receipt
+        .diff_summary
+        .upped
+        .iter()
+        .find_map(|s| s.substate_id.as_component_address())
+        .context("no component addr")?;
+    let ballot_resource = receipt
+        .diff_summary
+        .upped
+        .iter()
+        .find_map(|s| s.substate_id.as_resource_address().filter(|a| *a != TARI_TOKEN))
+        .context("no resource addr")?;
+    println!("  component: {component}\n  ballot resource: {ballot_resource}");
+    Ok((component, ballot_resource, ballot_utxos))
 }
 
 async fn convert_to_stealth_tari(
@@ -366,8 +361,6 @@ async fn main() -> Result<()> {
 
     faucet(&mut initiator_provider, "Initiator").await?;
     let template_address = publish_template(&mut initiator_provider).await?;
-    let (component, ballot_resource) =
-        create_vote_component(&mut initiator_provider, template_address).await?;
 
     let voter_wallets: Vec<(OotleWallet, Address)> = (0..VOTER_COUNT)
         .map(|i| {
@@ -379,11 +372,10 @@ async fn main() -> Result<()> {
         .collect();
     let voter_addresses: Vec<Address> = voter_wallets.iter().map(|(_, a)| a.clone()).collect();
 
-    let ballot_utxos = initiate_vote(
+    let (component, ballot_resource, ballot_utxos) = create_and_initiate_vote(
         &mut initiator_provider,
-        component,
+        template_address,
         &voter_addresses,
-        ballot_resource,
     )
     .await?;
 

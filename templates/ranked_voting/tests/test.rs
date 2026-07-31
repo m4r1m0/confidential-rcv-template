@@ -387,11 +387,19 @@ fn test_sequential_irv_redistribution_between_seats() {
 // These test the template's assertion guards directly using tari_template_test_tooling
 // (in-process, no testnet needed). They cover the adversarial cases from review feedback:
 // wrong token type, double-vote amount, expired election, nonsense parameters, invalid rankings.
+//
+// Each test creates the component with the vote parameters in one `call_function("new", ...)`
+// call. Tests that check invalid parameters assert on the constructor itself; tests that need a
+// valid component use `create_vote` with valid params then exercise the post-creation methods.
 
-/// Sets up a RankedVote component with a pre-allocated ballot resource and returns
-/// (template_address, component_address, ballot_resource_address, test, account, proof, secret).
-fn setup_vote_component() -> (
-    tari_template_lib::types::TemplateAddress,
+/// Creates a RankedVote component with the given parameters and returns
+/// (component_address, ballot_resource_address, test, account, proof, secret).
+fn create_vote(
+    voter_count: u64,
+    num_candidates: u32,
+    num_winners: u32,
+    expires_at_epoch: u64,
+) -> (
     tari_template_lib::types::ComponentAddress,
     tari_template_lib::types::ResourceAddress,
     TemplateTest,
@@ -403,11 +411,24 @@ fn setup_vote_component() -> (
     let template_address = test.get_template_address("RankedVote");
     let (account, proof, secret) = test.create_funded_account();
 
-    // Create the component with a pre-allocated ballot resource.
+    let output_amounts: Vec<u64> = (0..voter_count).map(|_| 1).collect();
+    let mint_data = generate_mint_statement(output_amounts, 0u64, None);
+
     let transaction = test
         .transaction()
         .allocate_resource_address("ballot_res")
-        .call_function(template_address, "new", args![Workspace("ballot_res")])
+        .call_function(
+            template_address,
+            "new",
+            args![
+                Workspace("ballot_res"),
+                voter_count,
+                num_candidates,
+                num_winners,
+                expires_at_epoch,
+                mint_data.statement,
+            ],
+        )
         .build_and_seal(&secret);
 
     let result = test.execute_expect_success(transaction, vec![proof.clone()]);
@@ -428,35 +449,32 @@ fn setup_vote_component() -> (
         .find_map(|(id, _)| id.as_resource_address())
         .expect("ballot resource address");
 
-    (template_address, component_address, ballot_resource, test, account, proof, secret)
+    (component_address, ballot_resource, test, account, proof, secret)
 }
 
-/// Builds and executes a initiate_vote transaction that mints stealth ballot UTXOs.
-fn initiate_vote(
-    test: &mut TemplateTest,
-    template_address: tari_template_lib::types::TemplateAddress,
-    component_address: tari_template_lib::types::ComponentAddress,
-    ballot_resource: tari_template_lib::types::ResourceAddress,
+/// Attempts to create a vote with the given parameters, expecting failure. Returns the
+/// reject reason for assertion.
+fn create_vote_expect_failure(
     voter_count: u64,
     num_candidates: u32,
     num_winners: u32,
     expires_at_epoch: u64,
-    secret: &tari_template_test_tooling::crypto::RistrettoSecretKey,
-) {
-    // Build a mint statement for voter_count stealth outputs of amount 1 each.
+) -> tari_template_test_tooling::engine_types::commit_result::RejectReason {
+    let mut test = TemplateTest::my_crate();
+    let template_address = test.get_template_address("RankedVote");
+    let (_account, _proof, secret) = test.create_funded_account();
+
     let output_amounts: Vec<u64> = (0..voter_count).map(|_| 1).collect();
-    let mint_data = generate_mint_statement(
-        output_amounts,
-        0u64, // no revealed output
-        None,
-    );
+    let mint_data = generate_mint_statement(output_amounts, 0u64, None);
 
     let transaction = test
         .transaction()
-        .call_method(
-            component_address,
-            "initiate_vote",
+        .allocate_resource_address("ballot_res")
+        .call_function(
+            template_address,
+            "new",
             args![
+                Workspace("ballot_res"),
                 voter_count,
                 num_candidates,
                 num_winners,
@@ -464,90 +482,33 @@ fn initiate_vote(
                 mint_data.statement,
             ],
         )
-        .build_and_seal(secret);
+        .build_and_seal(&secret);
 
-    test.execute_expect_success(transaction, vec![]);
+    test.execute_expect_failure(transaction, vec![])
 }
 
 #[test]
 fn rejects_zero_voter_count() {
-    let (template_address, component, ballot_resource, mut test, _account, _proof, secret) =
-        setup_vote_component();
-
-    let output_amounts: Vec<u64> = vec![];
-    let mint_data = generate_mint_statement(output_amounts, 0u64, None);
-
-    let transaction = test
-        .transaction()
-        .call_method(
-            component,
-            "initiate_vote",
-            args![0u64, 3u32, 1u32, 1000u64, mint_data.statement],
-        )
-        .build_and_seal(&secret);
-
-    let reason = test.execute_expect_failure(transaction, vec![]);
+    let reason = create_vote_expect_failure(0, 3, 1, 1000);
     assert_reject_reason(reason, "voter_count must be positive");
 }
 
 #[test]
 fn rejects_zero_candidates() {
-    let (template_address, component, ballot_resource, mut test, _account, _proof, secret) =
-        setup_vote_component();
-
-    let output_amounts: Vec<u64> = vec![1];
-    let mint_data = generate_mint_statement(output_amounts, 0u64, None);
-
-    let transaction = test
-        .transaction()
-        .call_method(
-            component,
-            "initiate_vote",
-            args![1u64, 0u32, 1u32, 1000u64, mint_data.statement],
-        )
-        .build_and_seal(&secret);
-
-    let reason = test.execute_expect_failure(transaction, vec![]);
+    let reason = create_vote_expect_failure(1, 0, 1, 1000);
     assert_reject_reason(reason, "num_candidates must be positive");
 }
 
 #[test]
 fn rejects_more_winners_than_candidates() {
-    let (template_address, component, ballot_resource, mut test, _account, _proof, secret) =
-        setup_vote_component();
-
-    let output_amounts: Vec<u64> = vec![1];
-    let mint_data = generate_mint_statement(output_amounts, 0u64, None);
-
-    let transaction = test
-        .transaction()
-        .call_method(
-            component,
-            "initiate_vote",
-            args![1u64, 2u32, 3u32, 1000u64, mint_data.statement],
-        )
-        .build_and_seal(&secret);
-
-    let reason = test.execute_expect_failure(transaction, vec![]);
+    let reason = create_vote_expect_failure(1, 2, 3, 1000);
     assert_reject_reason(reason, "num_winners cannot exceed num_candidates");
 }
 
 #[test]
 fn rejects_ballot_after_vote_closed() {
-    let (template_address, component, ballot_resource, mut test, account, proof, secret) =
-        setup_vote_component();
-
-    initiate_vote(
-        &mut test,
-        template_address,
-        component,
-        ballot_resource,
-        1,
-        2,
-        1,
-        1000,
-        &secret,
-    );
+    let (component, _ballot_resource, mut test, account, proof, secret) =
+        create_vote(1, 2, 1, 1000);
 
     // End the vote.
     let end_transaction = test
@@ -571,21 +532,8 @@ fn rejects_ballot_after_vote_closed() {
 
 #[test]
 fn rejects_ballot_after_expiration() {
-    let (template_address, component, ballot_resource, mut test, account, proof, secret) =
-        setup_vote_component();
-
-    // Initiate with expiration at epoch 10.
-    initiate_vote(
-        &mut test,
-        template_address,
-        component,
-        ballot_resource,
-        1,
-        2,
-        1,
-        10,
-        &secret,
-    );
+    let (component, _ballot_resource, mut test, account, proof, secret) =
+        create_vote(1, 2, 1, 10);
 
     // Advance the epoch past the expiration.
     test.set_virtual_substate(
@@ -608,20 +556,8 @@ fn rejects_ballot_after_expiration() {
 
 #[test]
 fn rejects_end_vote_expired_before_deadline() {
-    let (template_address, component, ballot_resource, mut test, _account, _proof, secret) =
-        setup_vote_component();
-
-    initiate_vote(
-        &mut test,
-        template_address,
-        component,
-        ballot_resource,
-        1,
-        2,
-        1,
-        100,
-        &secret,
-    );
+    let (component, _ballot_resource, mut test, _account, _proof, secret) =
+        create_vote(1, 2, 1, 100);
 
     // Epoch is still 0 (default), well before expiration at 100.
     let transaction = test
