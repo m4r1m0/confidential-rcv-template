@@ -80,9 +80,8 @@ After expiration, `end_vote_expired()` (single-winner), `end_vote_expired_multi(
 
 | Method | Access | Description |
 |---|---|---|
-| `new(alloc)` | — | Constructor. Creates the stealth ballot resource and empty ballot pool. Pre-allocates the resource address. |
+| `new(alloc, voter_count, num_candidates, num_winners, expires_at_epoch, mint_statement)` | — | Constructor. Creates the stealth ballot resource, mints per-voter stealth ballot UTXOs, and starts the vote — all in one transaction. `num_winners=1` → IRV, `>1` → STV. |
 | `resource_address()` | allow_all | Returns the ballot-token resource address. |
-| `initiate_vote(voter_count, num_candidates, num_winners, expires_at_epoch, mint_statement)` | initiator-only | Mints per-voter stealth ballot UTXOs. Starts the vote. `num_winners=1` → IRV, `>1` → STV. |
 | `cast_ballot(bucket, ranking)` | allow_all | Deposits one token + records a full ranking. Identity-free. Rejects after expiration. |
 | `ballot_count()` | allow_all | Returns the number of ballots cast so far. |
 | `ballot_vault_balance()` | allow_all | Returns the ballot pool vault balance (cross-check: equals `ballot_count`). |
@@ -96,7 +95,7 @@ After expiration, `end_vote_expired()` (single-winner), `end_vote_expired_multi(
 | `end_vote_expired_multi()` | initiator-only | Finalizes an expired election with sequential-IRV result (default multi-winner). |
 | `end_vote_expired_stv()` | initiator-only | Finalizes an expired election with STV result (alternative). |
 
-> **Before publishing:** set `INITIATOR_1` / `INITIATOR_2` to the `RistrettoPublicKeyBytes` of the addresses allowed to initiate/end votes, and switch the `initiate_vote` / `end_vote` access rules from `allow_all` to `initiator_rule()`. Voter confidentiality does not depend on this (ballots are identity-free regardless), but without it anyone can start or end a vote.
+> **Before publishing:** set `INITIATOR_1` / `INITIATOR_2` to the `RistrettoPublicKeyBytes` of the addresses allowed to initiate/end votes, and switch the `end_vote` access rules from `allow_all` to `initiator_rule()`. Voter confidentiality does not depend on this (ballots are identity-free regardless), but without it anyone can end a vote.
 
 ## Project layout
 
