@@ -1,15 +1,28 @@
 use tari_template_lib::prelude::*;
+use tari_template_lib::template_macro_deps::minicbor;
 
-/// Placeholder initiator public keys. Replace these with the real RistrettoPublicKeyBytes of the
-/// addresses allowed to end a vote before publishing. Any one of them may finalize a vote. Note
-/// that creating a vote (`new`) is intentionally NOT initiator-gated: the ballot supply is capped
-/// by the sealed mint badge, not by the caller's key.
-const INITIATOR_1: RistrettoPublicKeyBytes = RistrettoPublicKeyBytes::zero();
-const INITIATOR_2: RistrettoPublicKeyBytes = RistrettoPublicKeyBytes::zero();
-
-/// Returns the access rule that gates initiator-only methods.
-fn initiator_rule() -> AccessRule {
-    rule!(any_of(public_key(INITIATOR_1), public_key(INITIATOR_2)))
+/// The tally algorithm used for multi-winner elections (`num_winners > 1`). Chosen once at
+/// contract initialization and stored in the component, so the outcome cannot be picked after
+/// the fact based on which method gives a more favorable result.
+///
+/// Which variants exist in a given build is fixed at compile time by cargo features:
+/// `SequentialIrv` is always available, `Stv` only when built with `--features stv`.
+///
+/// This type lives at crate root (rather than inside the `#[template]` module) because it is a
+/// function input argument: the template macro's generated dispatcher decodes arguments at crate
+/// scope, where items defined inside the template module cannot be resolved.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, minicbor::Encode, minicbor::Decode, minicbor::CborLen,
+)]
+pub enum MultiWinnerMethod {
+    /// Fill each seat by running single-winner IRV, removing the winner, and repeating.
+    #[n(0)]
+    SequentialIrv,
+    /// Single transferable vote with the Droop quota (proportional representation). Requires
+    /// the `stv` feature.
+    #[cfg(feature = "stv")]
+    #[n(1)]
+    Stv,
 }
 
 /// Pure instant-runoff tally logic, isolated from the template engine so it can be unit-tested
@@ -97,8 +110,10 @@ pub mod irv {
 /// template engine so it can be unit-tested directly. Returns simple types (winners + per-round
 /// data) with no dependency on template ABI traits.
 ///
-/// This module is self-contained and modular: to strip multi-winner support, delete this module
-/// and remove the dispatch in `result()`. The IRV module (`pub mod irv`) is independent.
+/// This module is compiled only when the `stv` feature is enabled (off by default in a
+/// `--no-default-features` build). The `stv` variant of `MultiWinnerMethod` / `VoteResult` in the
+/// template module mirrors this gate. The IRV module (`pub mod irv`) is always compiled.
+#[cfg(feature = "stv")]
 pub mod stv {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -281,11 +296,14 @@ pub mod stv {
 /// fractional weights) and reuses the existing `run_irv` function directly.
 ///
 /// This is the **default multi-winner method** when `num_winners > 1`. STV remains available
-/// via `result_stv()` for those who prefer proportional representation, but sequential IRV is
-/// simpler and easier to audit.
+/// (with the `stv` feature) for those who prefer proportional representation, but sequential IRV
+/// is simpler and easier to audit.
 ///
-/// This module is self-contained and modular: to strip it, delete this module and remove the
-/// `result_multi` / `end_vote_multi` / `end_vote_expired_multi` methods.
+/// This module is compiled only when the `sequential-irv` feature is enabled (the default; off in
+/// a `--no-default-features` build). The `SequentialIrv` variant of `MultiWinnerMethod` /
+/// `VoteResult` in the template module mirrors this gate: the variant always exists so the enum
+/// is never empty, but `new` rejects it when this module is not compiled in.
+#[cfg(feature = "sequential-irv")]
 pub mod sequential_irv {
     use super::irv::{run_irv, Round as IrvRound};
 
@@ -333,17 +351,15 @@ pub mod sequential_irv {
             }
 
             // Build a mapping from original candidate id → reindexed id (0..N) for run_irv.
-            let original_to_reindexed: std::collections::BTreeMap<u32, u32> =
-                remaining_candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(reindexed, &original)| (original, reindexed as u32))
-                    .collect();
-            let reindexed_to_original: std::collections::BTreeMap<u32, u32> =
-                original_to_reindexed
-                    .iter()
-                    .map(|(&original, &reindexed)| (reindexed, original))
-                    .collect();
+            let original_to_reindexed: std::collections::BTreeMap<u32, u32> = remaining_candidates
+                .iter()
+                .enumerate()
+                .map(|(reindexed, &original)| (original, reindexed as u32))
+                .collect();
+            let reindexed_to_original: std::collections::BTreeMap<u32, u32> = original_to_reindexed
+                .iter()
+                .map(|(&original, &reindexed)| (reindexed, original))
+                .collect();
 
             // Reindex each ballot's candidates to the 0..N range, preserving preference order.
             let reindexed_ballots: Vec<Vec<u32>> = current_ballots
@@ -411,11 +427,13 @@ pub mod sequential_irv {
 /// ownerless (`OwnerRule::None`), so the resource-owner authorization path cannot be used to
 /// bypass the mint rule either.
 #[template]
-mod ranked_voting {
-    use super::*;
+pub mod ranked_voting {
     use super::irv::run_irv;
-    use super::stv::run_stv;
+    #[cfg(feature = "sequential-irv")]
     use super::sequential_irv::run_sequential_irv;
+    #[cfg(feature = "stv")]
+    use super::stv::run_stv;
+    use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
     pub struct RankedVote {
@@ -432,9 +450,12 @@ mod ranked_voting {
         ballot_vault: Vault,
         ballots: Vec<Vec<u32>>,
         num_candidates: u32,
-        /// Number of winners to elect. 1 = single-winner IRV; >1 = multi-winner sequential IRV
-        /// (default) or STV (explicit via `result_stv`).
+        /// Number of winners to elect. 1 = single-winner IRV; >1 = multi-winner via the method
+        /// chosen in `new` (`MultiWinnerMethod`).
         num_winners: u32,
+        /// The tally algorithm used for multi-winner elections (`num_winners > 1`). Pinned once
+        /// at construction; the outcome cannot later be picked from whichever method is favorable.
+        multi_winner_method: MultiWinnerMethod,
         /// The number of eligible voters: the ballot supply minted at construction. The supply
         /// can never grow after construction (see `mint_badge_vault`).
         voter_count: u64,
@@ -444,7 +465,26 @@ mod ranked_voting {
         active: bool,
     }
 
+    /// The result of a tally, returned by `result()` / `end_vote()` / `end_vote_expired()`.
+    ///
+    /// The variant is fixed by the election's configuration: `num_winners == 1` always yields
+    /// `Irv`, and multi-winner elections yield whichever variant the `MultiWinnerMethod` chosen
+    /// at initialization produces. Which multi-winner variants exist mirrors the
+    /// `MultiWinnerMethod` enum and therefore the cargo features.
+    #[derive(Clone, Debug)]
+    pub enum VoteResult {
+        /// Single-winner instant-runoff result.
+        Irv(IrvResult),
+        /// Sequential-IRV multi-winner result (requires the `sequential-irv` feature).
+        #[cfg(feature = "sequential-irv")]
+        SequentialIrv(SequentialIrvResult),
+        /// STV multi-winner result (requires the `stv` feature).
+        #[cfg(feature = "stv")]
+        Stv(StvResult),
+    }
+
     /// Result of an instant-runoff tally.
+    #[derive(Clone, Debug)]
     pub struct IrvResult {
         /// The winning candidate id, or `None` if no winner could be determined.
         pub winner: Option<u32>,
@@ -454,6 +494,7 @@ mod ranked_voting {
     }
 
     /// One round of the instant-runoff tally.
+    #[derive(Clone, Debug)]
     pub struct RoundTally {
         /// First-preference counts among still-active candidates in this round.
         pub counts: BTreeMap<u32, u64>,
@@ -462,6 +503,7 @@ mod ranked_voting {
     }
 
     /// Result of a single-transferable-vote (multi-winner) tally.
+    #[derive(Clone, Debug)]
     pub struct StvResult {
         /// The winning candidate ids, in the order they were elected.
         pub winners: Vec<u32>,
@@ -470,6 +512,7 @@ mod ranked_voting {
     }
 
     /// One round of the STV tally.
+    #[derive(Clone, Debug)]
     pub struct StvRoundTally {
         /// Vote counts (scaled) for each still-active candidate in this round.
         pub counts: BTreeMap<u32, u64>,
@@ -482,6 +525,7 @@ mod ranked_voting {
     }
 
     /// Result of a sequential-IRV (multi-winner) tally. This is the default multi-winner method.
+    #[derive(Clone, Debug)]
     pub struct SequentialIrvResult {
         /// The winning candidate ids, in the order they were elected.
         pub winners: Vec<u32>,
@@ -491,6 +535,7 @@ mod ranked_voting {
     }
 
     /// One seat's election in the sequential-IRV tally.
+    #[derive(Clone, Debug)]
     pub struct SequentialRoundTally {
         /// The candidate who won this seat, or `None` if no winner could be determined.
         pub winner: Option<u32>,
@@ -511,23 +556,29 @@ mod ranked_voting {
         ///   voter.
         /// - `num_candidates`: Number of candidates. Each ballot must be a permutation of
         ///   `0..num_candidates`.
-        /// - `num_winners`: Number of seats to fill. 1 = single-winner IRV, >1 = multi-winner
-        ///   STV with Droop quota and surplus transfer.
+        /// - `num_winners`: Number of seats to fill. 1 = single-winner IRV; >1 = multi-winner
+        ///   via `multi_winner_method`.
+        /// - `multi_winner_method`: The tally algorithm for multi-winner elections
+        ///   (`num_winners > 1`). Pinned here and stored in the component, so the outcome cannot
+        ///   be picked after the fact based on whichever method gives a favorable result.
         /// - `expires_at_epoch`: Deadline after which no more ballots may be cast. Prevents
         ///   elections from being held up indefinitely by voters who never spend their stealth
-        ///   ballot tokens. After expiration, `end_vote_expired()` (or `end_vote_expired_stv()`)
-        ///   finalizes the tally with whatever ballots were cast.
+        ///   ballot tokens. After expiration, `end_vote_expired()` finalizes the tally with
+        ///   whatever ballots were cast.
         /// - `mint_statement`: Built off-chain by the initiator's wallet. Must carry exactly
         ///   `voter_count` as its revealed input amount and one stealth output per voter.
         ///
-        /// The ballot supply is permanently capped at `voter_count`: the mint rule of the ballot
-        /// resource requires a proof of a one-of badge that is sealed in the component by this
-        /// call, so no further ballots can ever be minted.
+        /// The caller of `new` is the initiator: only they may end the vote. No template fields
+        /// need to be edited before publishing — the initiator's key is captured from the
+        /// transaction here, and the ballot supply is permanently capped at `voter_count`: the
+        /// mint rule of the ballot resource requires a proof of a one-of badge that is sealed in
+        /// the component by this call, so no further ballots can ever be minted.
         pub fn new(
             alloc: ResourceAddressAllocation,
             voter_count: u64,
             num_candidates: u32,
             num_winners: u32,
+            multi_winner_method: MultiWinnerMethod,
             expires_at_epoch: u64,
             mint_statement: StealthTransferStatement,
         ) -> Component<Self> {
@@ -543,6 +594,22 @@ mod ranked_voting {
                 Amount::from(voter_count),
                 "mint statement revealed input must equal voter_count",
             );
+            // A multi-winner method can only be used if this build compiled it in. The
+            // `SequentialIrv` variant always exists (so `MultiWinnerMethod` is never empty), but
+            // it requires the `sequential-irv` feature; the failure is a runtime abort here
+            // rather than a broken build. Single-winner elections (`num_winners == 1`) are
+            // unaffected — the method is ignored for them.
+            assert!(
+                num_winners == 1
+                    || !matches!(multi_winner_method, MultiWinnerMethod::SequentialIrv)
+                    || cfg!(feature = "sequential-irv"),
+                "MultiWinnerMethod::SequentialIrv requires the `sequential-irv` feature (build with `--features sequential-irv`)",
+            );
+
+            // The caller of `new` is the initiator: they may burn ballots and end the vote.
+            // Capturing the key here instead of hard-coding placeholders means nothing needs to
+            // be edited before publishing.
+            let initiator = CallerContext::transaction_signer_public_key();
 
             // The ballot resource's mint rule requires a proof of a one-of NFT badge that is
             // sealed in `mint_badge_vault` when the component is created. The badge authorizes
@@ -569,7 +636,7 @@ mod ranked_voting {
                 .with_divisibility(0)
                 .with_owner_rule(OwnerRule::None)
                 .mintable(rule!(resource(mint_badge_resource)), LOCKED)
-                .burnable(initiator_rule(), LOCKED)
+                .burnable(rule!(public_key(initiator)), LOCKED)
                 .with_address_allocation(alloc)
                 .build();
 
@@ -593,30 +660,25 @@ mod ranked_voting {
                 ballots: Vec::new(),
                 num_candidates,
                 num_winners,
+                multi_winner_method,
                 voter_count,
                 expires_at_epoch,
                 active: true,
             })
             .with_access_rules(
                 AccessRules::new()
-                    // TODO(before publishing): replace allow_all with `initiator_rule()` once the
-                    // real initiator public keys are set in INITIATOR_1/INITIATOR_2 above. Kept
-                    // allow_all here so the integration test (random wallets) can drive the flow;
-                    // voter confidentiality does not depend on this.
-                    .method("end_vote", rule!(allow_all))
-                    .method("end_vote_stv", rule!(allow_all))
-                    .method("end_vote_multi", rule!(allow_all))
-                    .method("end_vote_expired", rule!(allow_all))
-                    .method("end_vote_expired_stv", rule!(allow_all))
-                    .method("end_vote_expired_multi", rule!(allow_all))
-                    // cast_ballot / result / result_stv / result_multi / ballot_count /
-                    // resource_address are callable by anyone; they deliberately do NOT call
+                    // Initiator-only: the caller of `new` is the initiator, and their key (see
+                    // above) is the only one that may end the vote. Voter confidentiality does
+                    // not depend on this gate — even a compromised initiator key cannot inflate
+                    // the ballot supply, which the sealed mint badge caps.
+                    .method("end_vote", rule!(public_key(initiator)))
+                    .method("end_vote_expired", rule!(public_key(initiator)))
+                    // cast_ballot / result / ballot_count / resource_address are callable by
+                    // anyone; they deliberately do NOT call
                     // CallerContext::transaction_signer_public_key() so that voters' transactions
                     // can be sealed with an ephemeral key (no identity).
                     .method("cast_ballot", rule!(allow_all))
                     .method("result", rule!(allow_all))
-                    .method("result_stv", rule!(allow_all))
-                    .method("result_multi", rule!(allow_all))
                     .method("ballot_count", rule!(allow_all))
                     .method("ballot_vault_balance", rule!(allow_all))
                     .method("voter_count", rule!(allow_all))
@@ -668,7 +730,10 @@ mod ranked_voting {
             // provably spent (single-spend enforced by the engine); the vault balance equals the
             // number of ballots cast.
             self.ballot_vault.deposit(bucket);
-            emit_event("BallotCast", metadata!["ballots" => self.ballots.len().to_string()]);
+            emit_event(
+                "BallotCast",
+                metadata!["ballots" => self.ballots.len().to_string()],
+            );
         }
 
         /// Number of ballots cast so far.
@@ -681,9 +746,19 @@ mod ranked_voting {
             self.ballot_vault.balance()
         }
 
-        /// Compute the single-winner instant-runoff result. Use when `num_winners == 1`.
-        /// Read-only and deterministic. Returns the winner (if any) and the per-round tally.
-        pub fn result(&self) -> IrvResult {
+        /// Compute the tally for the configured election: single-winner IRV when
+        /// `num_winners == 1`, otherwise the multi-winner method pinned in `new`
+        /// (`MultiWinnerMethod`). Read-only and deterministic.
+        pub fn result(&self) -> VoteResult {
+            if self.num_winners == 1 {
+                VoteResult::Irv(self.irv_result())
+            } else {
+                self.multi_winner_result()
+            }
+        }
+
+        /// Single-winner instant-runoff tally. Emits a `Result` event.
+        fn irv_result(&self) -> IrvResult {
             let (winner, rounds) = run_irv(&self.ballots, self.num_candidates);
             let rounds: Vec<RoundTally> = rounds
                 .into_iter()
@@ -706,39 +781,28 @@ mod ranked_voting {
             result
         }
 
-        /// Compute the multi-winner STV result. Use when `num_winners > 1`.
-        /// Read-only and deterministic. Returns the winners (in election order) and per-round
-        /// tally.
-        pub fn result_stv(&self) -> StvResult {
-            let (winners, rounds) =
-                run_stv(&self.ballots, self.num_candidates, self.num_winners);
-            let rounds: Vec<StvRoundTally> = rounds
-                .into_iter()
-                .map(|round| StvRoundTally {
-                    counts: round.counts,
-                    elected: round.elected,
-                    eliminated: round.eliminated,
-                    quota: round.quota,
-                })
-                .collect();
-            let result = StvResult { winners, rounds };
-            emit_event(
-                "ResultStv",
-                metadata![
-                    "winners" => format!("{:?}", result.winners),
-                    "rounds" => result.rounds.len().to_string(),
-                ],
-            );
-            result
+        /// Multi-winner tally via the method pinned in `new`. Which arms exist mirrors the
+        /// `MultiWinnerMethod` variants and therefore the cargo features; `new` rejects methods
+        /// whose tally logic is not compiled in.
+        fn multi_winner_result(&self) -> VoteResult {
+            match self.multi_winner_method {
+                #[cfg(feature = "sequential-irv")]
+                MultiWinnerMethod::SequentialIrv => {
+                    VoteResult::SequentialIrv(self.sequential_irv_result())
+                }
+                #[cfg(not(feature = "sequential-irv"))]
+                MultiWinnerMethod::SequentialIrv => unreachable!(
+                    "MultiWinnerMethod::SequentialIrv requires the `sequential-irv` feature; `new` rejects it",
+                ),
+                #[cfg(feature = "stv")]
+                MultiWinnerMethod::Stv => VoteResult::Stv(self.stv_result()),
+            }
         }
 
-        /// Compute the multi-winner sequential-IRV result. This is the **default multi-winner
-        /// method** when `num_winners > 1`. Runs single-winner IRV to fill each seat, removing
-        /// the winner from all ballots before the next seat.
-        ///
-        /// Read-only and deterministic. Returns the winners (in election order) and a per-seat
-        /// tally trace containing the IRV sub-rounds for each seat.
-        pub fn result_multi(&self) -> SequentialIrvResult {
+        /// Sequential-IRV multi-winner tally (requires the `sequential-irv` feature). Emits a
+        /// `ResultMulti` event.
+        #[cfg(feature = "sequential-irv")]
+        fn sequential_irv_result(&self) -> SequentialIrvResult {
             let (winners, seats) =
                 run_sequential_irv(&self.ballots, self.num_candidates, self.num_winners);
             let seats: Vec<SequentialRoundTally> = seats
@@ -766,57 +830,49 @@ mod ranked_voting {
             result
         }
 
+        /// STV multi-winner tally (requires the `stv` feature). Emits a `ResultStv` event.
+        #[cfg(feature = "stv")]
+        fn stv_result(&self) -> StvResult {
+            let (winners, rounds) = run_stv(&self.ballots, self.num_candidates, self.num_winners);
+            let rounds: Vec<StvRoundTally> = rounds
+                .into_iter()
+                .map(|round| StvRoundTally {
+                    counts: round.counts,
+                    elected: round.elected,
+                    eliminated: round.eliminated,
+                    quota: round.quota,
+                })
+                .collect();
+            let result = StvResult { winners, rounds };
+            emit_event(
+                "ResultStv",
+                metadata![
+                    "winners" => format!("{:?}", result.winners),
+                    "rounds" => result.rounds.len().to_string(),
+                ],
+            );
+            result
+        }
+
         /// End the vote (initiator-only). Locks the vote against further ballots and returns the
-        /// final single-winner result. Use when `num_winners == 1`.
-        pub fn end_vote(&mut self) -> IrvResult {
+        /// tally for the configured election: single-winner IRV when `num_winners == 1`,
+        /// otherwise the multi-winner method pinned in `new`.
+        pub fn end_vote(&mut self) -> VoteResult {
             assert!(self.active, "No active vote");
             self.active = false;
             let result = self.result();
             emit_event(
                 "VoteEnded",
-                metadata![
-                    "winner" => match result.winner {
-                        Some(w) => w.to_string(),
-                        None => "none".to_string(),
-                    },
-                ],
+                metadata!["ballots_cast" => self.ballots.len().to_string()],
             );
             result
         }
 
-        /// End the vote with a multi-winner STV result. Use when `num_winners > 1` and you
-        /// explicitly want STV (proportional representation). For the default multi-winner
-        /// method, use `end_vote_multi()` instead.
-        pub fn end_vote_stv(&mut self) -> StvResult {
-            assert!(self.active, "No active vote");
-            self.active = false;
-            let result = self.result_stv();
-            emit_event(
-                "VoteEnded",
-                metadata!["winners" => format!("{:?}", result.winners)],
-            );
-            result
-        }
-
-        /// End the vote with a multi-winner sequential-IRV result. This is the **default
-        /// multi-winner method** when `num_winners > 1`.
-        pub fn end_vote_multi(&mut self) -> SequentialIrvResult {
-            assert!(self.active, "No active vote");
-            self.active = false;
-            let result = self.result_multi();
-            emit_event(
-                "VoteEnded",
-                metadata!["winners" => format!("{:?}", result.winners)],
-            );
-            result
-        }
-
-        /// End the vote after the voting period has expired, even if not all eligible voters cast
-        /// ballots. This prevents an election from being held up indefinitely by non-voting
-        /// participants. The tally is computed with whatever ballots were actually cast.
-        ///
-        /// Returns the single-winner IRV result. For multi-winner, use `end_vote_expired_stv()`.
-        pub fn end_vote_expired(&mut self) -> IrvResult {
+        /// End the vote after the voting period has expired (initiator-only), even if not all
+        /// eligible voters cast ballots. This prevents an election from being held up
+        /// indefinitely by non-voting participants. The tally is computed with whatever ballots
+        /// were actually cast, using the same dispatch as `end_vote`.
+        pub fn end_vote_expired(&mut self) -> VoteResult {
             assert!(self.active, "No active vote");
             let current_epoch = Consensus::current_epoch();
             assert!(
@@ -828,56 +884,7 @@ mod ranked_voting {
             let result = self.result();
             emit_event(
                 "VoteEndedExpired",
-                metadata![
-                    "winner" => match result.winner {
-                        Some(w) => w.to_string(),
-                        None => "none".to_string(),
-                    },
-                    "ballots_cast" => self.ballots.len().to_string(),
-                ],
-            );
-            result
-        }
-
-        /// End an expired multi-winner election with an STV result.
-        pub fn end_vote_expired_stv(&mut self) -> StvResult {
-            assert!(self.active, "No active vote");
-            let current_epoch = Consensus::current_epoch();
-            assert!(
-                current_epoch > self.expires_at_epoch,
-                "Voting period has not yet expired (current epoch {current_epoch}, deadline {})",
-                self.expires_at_epoch,
-            );
-            self.active = false;
-            let result = self.result_stv();
-            emit_event(
-                "VoteEndedExpired",
-                metadata![
-                    "winners" => format!("{:?}", result.winners),
-                    "ballots_cast" => self.ballots.len().to_string(),
-                ],
-            );
-            result
-        }
-
-        /// End an expired multi-winner election with a sequential-IRV result. This is the
-        /// **default multi-winner method** for expired elections when `num_winners > 1`.
-        pub fn end_vote_expired_multi(&mut self) -> SequentialIrvResult {
-            assert!(self.active, "No active vote");
-            let current_epoch = Consensus::current_epoch();
-            assert!(
-                current_epoch > self.expires_at_epoch,
-                "Voting period has not yet expired (current epoch {current_epoch}, deadline {})",
-                self.expires_at_epoch,
-            );
-            self.active = false;
-            let result = self.result_multi();
-            emit_event(
-                "VoteEndedExpired",
-                metadata![
-                    "winners" => format!("{:?}", result.winners),
-                    "ballots_cast" => self.ballots.len().to_string(),
-                ],
+                metadata!["ballots_cast" => self.ballots.len().to_string()],
             );
             result
         }

@@ -30,6 +30,7 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 use tari_crypto::ristretto::RistrettoPublicKey;
 use tari_ootle_transaction::args;
+use ranked_voting::MultiWinnerMethod;
 
 const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/ranked_voting.wasm";
 const VOTER_COUNT: usize = 3;
@@ -167,6 +168,7 @@ async fn create_and_initiate_vote(
                 voter_count,
                 NUM_CANDIDATES,
                 NUM_WINNERS,
+                MultiWinnerMethod::SequentialIrv,
                 EXPIRES_AT_EPOCH,
                 mint_statement,
             ],
