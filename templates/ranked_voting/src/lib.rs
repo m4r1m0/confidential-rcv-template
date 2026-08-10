@@ -1,7 +1,9 @@
 use tari_template_lib::prelude::*;
 
 /// Placeholder initiator public keys. Replace these with the real RistrettoPublicKeyBytes of the
-/// addresses allowed to initiate a vote before publishing. Any one of them may start a vote.
+/// addresses allowed to end a vote before publishing. Any one of them may finalize a vote. Note
+/// that creating a vote (`new`) is intentionally NOT initiator-gated: the ballot supply is capped
+/// by the sealed mint badge, not by the caller's key.
 const INITIATOR_1: RistrettoPublicKeyBytes = RistrettoPublicKeyBytes::zero();
 const INITIATOR_2: RistrettoPublicKeyBytes = RistrettoPublicKeyBytes::zero();
 
@@ -402,6 +404,12 @@ pub mod sequential_irv {
 ///
 /// Double-voting is impossible: each voter receives exactly one indivisible amount-1 token, and a
 /// stealth UTXO can only be spent once.
+///
+/// The ballot supply is also permanently capped: minting ballot tokens requires a proof of a
+/// one-of NFT badge that is sealed inside the component at construction. After the vote starts,
+/// nobody — including the initiator — can mint additional ballots. The ballot resource is
+/// ownerless (`OwnerRule::None`), so the resource-owner authorization path cannot be used to
+/// bypass the mint rule either.
 #[template]
 mod ranked_voting {
     use super::*;
@@ -412,6 +420,12 @@ mod ranked_voting {
 
     pub struct RankedVote {
         ballot_resource: ResourceAddress,
+        /// Resource holding the single one-of mint badge that authorizes minting ballot tokens.
+        mint_badge_resource: ResourceAddress,
+        /// Sealed vault holding the sole mint badge. The badge's mint/burn/recall rules are
+        /// `deny_all` with locked updaters and no template method exposes this vault, so the
+        /// ballot supply is permanently capped at `voter_count`.
+        mint_badge_vault: Vault,
         /// Persistent sink for spent ballot tokens. Its balance equals the number of ballots cast
         /// (each ballot is an indivisible amount-1 token), providing a trustless cross-check of
         /// `ballots.len()`.
@@ -421,6 +435,9 @@ mod ranked_voting {
         /// Number of winners to elect. 1 = single-winner IRV; >1 = multi-winner sequential IRV
         /// (default) or STV (explicit via `result_stv`).
         num_winners: u32,
+        /// The number of eligible voters: the ballot supply minted at construction. The supply
+        /// can never grow after construction (see `mint_badge_vault`).
+        voter_count: u64,
         /// The epoch after which no more ballots may be cast. Prevents elections from being held
         /// up indefinitely by voters who never spend their stealth ballot tokens.
         expires_at_epoch: u64,
@@ -502,6 +519,10 @@ mod ranked_voting {
         ///   finalizes the tally with whatever ballots were cast.
         /// - `mint_statement`: Built off-chain by the initiator's wallet. Must carry exactly
         ///   `voter_count` as its revealed input amount and one stealth output per voter.
+        ///
+        /// The ballot supply is permanently capped at `voter_count`: the mint rule of the ballot
+        /// resource requires a proof of a one-of badge that is sealed in the component by this
+        /// call, so no further ballots can ever be minted.
         pub fn new(
             alloc: ResourceAddressAllocation,
             voter_count: u64,
@@ -523,28 +544,56 @@ mod ranked_voting {
                 "mint statement revealed input must equal voter_count",
             );
 
+            // The ballot resource's mint rule requires a proof of a one-of NFT badge that is
+            // sealed in `mint_badge_vault` when the component is created. The badge authorizes
+            // the ballot mint inside this constructor only. The badge's mint/burn/recall rules
+            // are deny_all with locked updaters (no second badge can ever exist, and the sole
+            // copy can never be destroyed or recalled); its withdraw rule must stay allow_all
+            // because creating the constructor's proof is authorized by it — but the rule is
+            // inert after construction, since transactions cannot address vaults directly and no
+            // template method ever exposes `mint_badge_vault`. The ballot resource is ownerless,
+            // so the ballot supply is permanently capped at `voter_count`.
+            let badge_bucket = ResourceBuilder::non_fungible()
+                .with_token_symbol("RVOTE-MINT")
+                .with_owner_rule(OwnerRule::None)
+                .mintable(rule!(deny_all), LOCKED)
+                .burnable(rule!(deny_all), LOCKED)
+                .recallable(rule!(deny_all), LOCKED)
+                .withdrawable(rule!(allow_all), LOCKED)
+                .update_non_fungible_data(rule!(deny_all), LOCKED)
+                .initial_supply_with_data(vec![(NonFungibleId::from_u64(0), (&metadata![], &()))]);
+            let mint_badge_resource = badge_bucket.resource_address();
+
             let ballot_resource = ResourceBuilder::stealth()
                 .with_token_symbol("RVOTE")
                 .with_divisibility(0)
-                .mintable(initiator_rule(), LOCKED)
+                .with_owner_rule(OwnerRule::None)
+                .mintable(rule!(resource(mint_badge_resource)), LOCKED)
                 .burnable(initiator_rule(), LOCKED)
                 .with_address_allocation(alloc)
                 .build();
 
             // Mint voter_count revealed tokens and convert them into per-voter stealth UTXOs
             // via the caller-provided mint statement. Any revealed output (which there should
-            // not be) is dropped — the mint is fully converted to stealth outputs.
+            // not be) is dropped — the mint is fully converted to stealth outputs. The proof
+            // is dropped (releasing its lock on the badge) so the badge can be sealed in the
+            // component.
+            let mint_proof = badge_bucket.create_proof();
             let manager = ResourceManager::get(ballot_resource);
             let minted = manager.mint_stealth(Amount::from(voter_count));
-            let _revealed_out = manager
-                .stealth_transfer_with_opt_input_bucket(mint_statement, Some(minted));
+            let _revealed_out =
+                manager.stealth_transfer_with_opt_input_bucket(mint_statement, Some(minted));
+            mint_proof.drop();
 
             Component::new(Self {
                 ballot_resource,
+                mint_badge_resource,
+                mint_badge_vault: Vault::from_bucket(badge_bucket),
                 ballot_vault: Vault::new_empty(ballot_resource),
                 ballots: Vec::new(),
                 num_candidates,
                 num_winners,
+                voter_count,
                 expires_at_epoch,
                 active: true,
             })
@@ -570,6 +619,7 @@ mod ranked_voting {
                     .method("result_multi", rule!(allow_all))
                     .method("ballot_count", rule!(allow_all))
                     .method("ballot_vault_balance", rule!(allow_all))
+                    .method("voter_count", rule!(allow_all))
                     .method("resource_address", rule!(allow_all))
                     .default(rule!(deny_all)),
             )
@@ -579,6 +629,14 @@ mod ranked_voting {
         /// The ballot-token resource address (so the initiator can build outputs for it).
         pub fn resource_address(&self) -> ResourceAddress {
             self.ballot_resource
+        }
+
+        /// The number of eligible voters: the ballot supply minted at construction. The supply
+        /// can never grow after construction (the ballot resource's mint rule requires a proof of
+        /// a badge that is sealed in this component), so this is a hard cap on the number of
+        /// ballots that can ever be cast.
+        pub fn voter_count(&self) -> u64 {
+            self.voter_count
         }
 
         /// Deposit a revealed ballot-token bucket and record the voter's full ranking. `ranking`

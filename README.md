@@ -8,7 +8,7 @@ This template extends the [confidential-voting-template](https://github.com/m4r1
 
 This template inherits the **coinjoin-style blending** design from the sibling yes/no template (obscure *who sent what ballot*, not the ballot content):
 
-1. **Initiator mints stealth ballot tokens.** When a vote is initiated, the template mints one indivisible amount-1 ballot token per eligible voter and converts them into **stealth UTXOs** — each owned by a one-time key unlinkable to the voter's real public key. The stealth outputs are built off-chain by the initiator's wallet and passed to the template as a `StealthTransferStatement`.
+1. **Initiator mints stealth ballot tokens.** When a vote is initiated, the template mints one indivisible amount-1 ballot token per eligible voter and converts them into **stealth UTXOs** — each owned by a one-time key unlinkable to the voter's real public key. The stealth outputs are built off-chain by the initiator's wallet and passed to the template as a `StealthTransferStatement`. The supply is permanently capped at `voter_count` (see [Ballot supply cap](#ballot-supply-cap-no-extra-ballots)).
 
 2. **Voters spend privately.** Each voter spends their stealth ballot-token UTXO via `cast_ballot`, attaching their full ranking of the candidates. Because the spend is a **stealth transfer sealed with an ephemeral one-time key** (with the transaction fee paid from a separate stealth TARI UTXO), no on-chain observer can link the ballot transaction to a voter identity. The `cast_ballot` method deliberately never calls `CallerContext::transaction_signer_public_key()` so that ephemeral sealing works.
 
@@ -28,9 +28,24 @@ This is consistent with the sibling template's model: voter *anonymity* is prote
 
 Each voter receives exactly one indivisible amount-1 stealth token. A stealth UTXO can only be spent once — the engine enforces this at the consensus level. There is no way to split the token or spend it twice.
 
-### Fee-from-stealth requirement
+### Ballot supply cap (no extra ballots)
 
-For a ballot to be truly unlinkable, the transaction fee must also be paid unlinkably. Each voter converts revealed TARI into a stealth TARI UTXO first, then pays the ballot transaction's fee from that stealth UTXO (with change returned to another stealth UTXO). If the fee were paid from a revealed account instead, the transaction would be linkable to the account owner.
+The ballot supply is permanently capped at the initial `voter_count`; nobody — including the initiator — can mint additional ballots after the vote starts. The ballot resource's mint rule requires a proof of a **one-of NFT badge** ("RVOTE-MINT") that is created and sealed inside the component during `new()`:
+
+- The badge's own mint/burn/recall rules are `deny_all` with locked updaters, so no second badge can ever exist and the sole copy can never be destroyed or recalled.
+- The badge lives in a component vault that no template method exposes, and transactions cannot address vaults directly, so its proof can never be re-obtained.
+- The ballot resource is **ownerless** (`OwnerRule::None`), closing the resource-owner authorization path that would otherwise bypass the mint rule.
+- The mint rule's updater is `LOCKED`, so the rule itself can never be changed.
+
+The cap is verifiable by anyone: `voter_count()` returns the number of ballots minted, `ballot_vault_balance()` returns the number cast, and the ballot resource's total supply never exceeds `voter_count`.
+
+### Fee-from-stealth requirement (MUST)
+
+For a ballot to be truly unlinkable, the transaction fee must also be paid unlinkably. **Every ballot transaction MUST pay its fee from a stealth TARI UTXO.** Each voter converts revealed TARI into a stealth TARI UTXO first, then pays the ballot transaction's fee from that stealth UTXO (with change returned to another stealth UTXO).
+
+Paying the fee from a revealed source breaks anonymity completely: the fee input links the transaction to the account owner, and because the ballot transaction itself carries the voter's full ranking, that link exposes not only *who voted* but *how they voted*. A revealed fee input effectively defeats the entire stealth mechanism.
+
+The reference client in `client/integration` implements the canonical pattern in `cast_private_ballot`: a two-input stealth spend that uses the ballot-token UTXO as the seal input and a stealth TARI UTXO as the fee input, both bound to the same ephemeral one-time key. Wallet code that builds ballot transactions should follow that pattern exactly — the template cannot enforce it (it never sees fee inputs), so this requirement is a client-side contract.
 
 ## IRV tally algorithm (single-winner)
 
@@ -80,8 +95,9 @@ After expiration, `end_vote_expired()` (single-winner), `end_vote_expired_multi(
 
 | Method | Access | Description |
 |---|---|---|
-| `new(alloc, voter_count, num_candidates, num_winners, expires_at_epoch, mint_statement)` | — | Constructor. Creates the stealth ballot resource, mints per-voter stealth ballot UTXOs, and starts the vote — all in one transaction. `num_winners=1` → IRV, `>1` → STV. |
+| `new(alloc, voter_count, num_candidates, num_winners, expires_at_epoch, mint_statement)` | — | Constructor. Creates the stealth ballot resource, mints per-voter stealth ballot UTXOs, seals the mint badge (permanently capping the supply at `voter_count`), and starts the vote — all in one transaction. `num_winners=1` → IRV, `>1` → STV. |
 | `resource_address()` | allow_all | Returns the ballot-token resource address. |
+| `voter_count()` | allow_all | Returns the number of eligible voters (the ballot supply, which can never grow). |
 | `cast_ballot(bucket, ranking)` | allow_all | Deposits one token + records a full ranking. Identity-free. Rejects after expiration. |
 | `ballot_count()` | allow_all | Returns the number of ballots cast so far. |
 | `ballot_vault_balance()` | allow_all | Returns the ballot pool vault balance (cross-check: equals `ballot_count`). |
@@ -102,7 +118,7 @@ After expiration, `end_vote_expired()` (single-winner), `end_vote_expired_multi(
 ```
 templates/ranked_voting/         The template (Rust → WASM)
   src/lib.rs                     Template + pure IRV (pub mod irv) + STV (pub mod stv) + sequential IRV (pub mod sequential_irv)
-  tests/test.rs                  Unit + adversarial in-process tests (29 tests)
+  tests/test.rs                  Unit + adversarial in-process tests (30 tests)
 client/integration/              3-voter end-to-end test (IRV with redistribution)
 vendor/tari-ootle/               Git submodule: fork of tari-ootle with the two-input signing fix
 ```
