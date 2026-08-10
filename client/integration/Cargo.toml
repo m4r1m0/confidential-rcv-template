@@ -14,3 +14,6 @@ tari_crypto = "0.23"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 hex = "0.4"
+# The template crate exposes `MultiWinnerMethod` (and the other ABI types) on the host build,
+# which the client needs to construct the `new` arguments.
+ranked_voting = { path = "../../templates/ranked_voting" }
