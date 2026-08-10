@@ -246,6 +246,11 @@ async fn convert_to_stealth_tari(
     Ok((tari_commitment, tari_nonce))
 }
 
+/// Casts a ballot via a two-input stealth spend: the ballot-token UTXO is the seal input
+/// (spent into `cast_ballot`) and a stealth TARI UTXO pays the fee. This is the canonical
+/// pattern for the README's fee-from-stealth requirement — the fee MUST come from a stealth
+/// TARI UTXO, never a revealed account, or the transaction links the voter's identity to
+/// their public ranking.
 async fn cast_private_ballot(
     provider: &mut Provider,
     component: ComponentAddress,

@@ -1,8 +1,13 @@
 use ranked_voting::irv::run_irv;
 use ranked_voting::stv::run_stv;
 use ranked_voting::sequential_irv::run_sequential_irv;
-use tari_template_lib::prelude::{Consensus, Amount};
+use tari_template_lib::prelude::{rule, Consensus, Amount};
+use tari_template_lib::types::SubstateOwnerRule;
+use tari_template_lib::types::access_rules::{
+    AccessRule, RequireRule, ResourceAuthAction, RestrictedAccessRule, RuleRequirement, UpdateRule,
+};
 use tari_template_lib::types::constants::TARI_TOKEN;
+use tari_template_lib::types::crypto::RistrettoPublicKeyBytes;
 use tari_template_test_tooling::TemplateTest;
 use tari_template_test_tooling::transaction::{Transaction, args};
 use tari_template_test_tooling::support::stealth::generate_mint_statement;
@@ -440,14 +445,17 @@ fn create_vote(
         .up_iter()
         .find_map(|(id, _)| id.as_component_address())
         .expect("component address");
-    let ballot_resource = result
-        .finalize
-        .result
-        .accept()
-        .unwrap()
-        .up_iter()
-        .find_map(|(id, _)| id.as_resource_address())
-        .expect("ballot resource address");
+    // Two resources are created by `new` (the ballot resource and the sealed mint badge), so
+    // the ballot resource is identified semantically: it is the stealth resource that is not
+    // TARI (the test tooling's TARI token is itself a stealth resource).
+    let ballot_resource = test
+        .read_only_state_store()
+        .get_all_resources()
+        .expect("resources")
+        .into_iter()
+        .find(|(address, resource)| resource.resource_type().is_stealth() && *address != TARI_TOKEN)
+        .map(|(address, _)| address)
+        .expect("ballot resource");
 
     (component_address, ballot_resource, test, account, proof, secret)
 }
@@ -567,4 +575,90 @@ fn rejects_end_vote_expired_before_deadline() {
 
     let reason = test.execute_expect_failure(transaction, vec![]);
     assert_reject_reason(reason, "Voting period has not yet expired");
+}
+
+#[test]
+fn ballot_minting_is_permanently_revoked() {
+    let (component, ballot_resource, test, _account, _proof, _secret) = create_vote(3, 2, 1, 1000);
+
+    // The one-of mint badge is sealed inside the component; it is the component vault that does
+    // not hold ballot tokens.
+    let store = test.read_only_state_store();
+    let vaults = store
+        .get_vaults_for_component(component)
+        .expect("component vaults");
+    let badge_resource = vaults
+        .values()
+        .map(|vault| *vault.resource_address())
+        .find(|address| *address != ballot_resource)
+        .expect("badge vault");
+
+    let ballot_def = store
+        .get_resource(&ballot_resource)
+        .expect("ballot resource");
+    let badge_def = store.get_resource(&badge_resource).expect("badge resource");
+
+    // Minting ballot tokens requires a proof of the sealed badge, and the rule is locked so it
+    // can never be changed.
+    let ballot_rules = ballot_def.access_rules();
+    assert!(matches!(
+        ballot_rules.get_updater(&ResourceAuthAction::Mint),
+        UpdateRule::Locked,
+    ));
+    match ballot_rules.get_access_rule(&ResourceAuthAction::Mint) {
+        AccessRule::Restricted(RestrictedAccessRule::Require(RequireRule::Require(
+            RuleRequirement::Resource(address),
+        ))) => assert_eq!(address, &badge_resource),
+        other => panic!("unexpected ballot mint rule: {other:?}"),
+    }
+    // The ballot resource is ownerless, so the resource-owner authorization path (which would
+    // bypass the mint rule) is closed. Burning ballots requires the initiator's keys, which are
+    // unset (zero) placeholders, so no one can burn either; the withdraw rule stays allow_all
+    // because the constructor's mint-to-stealth conversion is authorized by it, but no template
+    // method ever exposes a ballot vault to callers, so it is inert.
+    assert_eq!(ballot_def.owner_rule(), &SubstateOwnerRule::None);
+    assert_eq!(
+        ballot_rules.get_access_rule(&ResourceAuthAction::Burn),
+        &rule!(any_of(
+            public_key(RistrettoPublicKeyBytes::zero()),
+            public_key(RistrettoPublicKeyBytes::zero())
+        )),
+    );
+    assert!(matches!(
+        ballot_rules.get_updater(&ResourceAuthAction::Burn),
+        UpdateRule::Locked,
+    ));
+
+    // The badge itself can never be minted, burned, recalled, or modified, so the one badge that
+    // exists at construction is the only one that will ever exist. Its withdraw rule stays
+    // allow_all (creating the constructor's mint proof is authorized by it) but is inert: vaults
+    // cannot be addressed by transactions, and no template method exposes the sealed badge vault.
+    let badge_rules = badge_def.access_rules();
+    for action in [
+        ResourceAuthAction::Mint,
+        ResourceAuthAction::Burn,
+        ResourceAuthAction::Recall,
+        ResourceAuthAction::UpdateNonFungibleData,
+    ] {
+        assert_eq!(badge_rules.get_access_rule(&action), &AccessRule::DenyAll);
+        assert!(matches!(
+            badge_rules.get_updater(&action),
+            UpdateRule::Locked
+        ));
+    }
+    assert_eq!(
+        badge_rules.get_access_rule(&ResourceAuthAction::Withdraw),
+        &AccessRule::AllowAll
+    );
+    assert!(matches!(
+        badge_rules.get_updater(&ResourceAuthAction::Withdraw),
+        UpdateRule::Locked
+    ));
+    assert_eq!(badge_def.total_supply(), Some(Amount::from(1u64)));
+
+    // Exactly one ballot per eligible voter was minted at construction, and the stored
+    // voter_count matches (field index 7 = the 8th field of `RankedVote`, in declaration order).
+    assert_eq!(ballot_def.total_supply(), Some(Amount::from(3u64)));
+    let voter_count: u64 = test.extract_component_value(component, "7");
+    assert_eq!(voter_count, 3);
 }
