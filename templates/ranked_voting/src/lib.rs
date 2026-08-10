@@ -196,8 +196,9 @@ pub mod stv {
             for ballot in &weighted_ballots {
                 for &candidate in &ballot.ranking {
                     if active.contains(&candidate) {
-                        *counts.get_mut(&candidate).expect("active candidate counted") +=
-                            ballot.weight;
+                        *counts
+                            .get_mut(&candidate)
+                            .expect("active candidate counted") += ballot.weight;
                         total_continuing += ballot.weight;
                         break;
                     }
@@ -305,7 +306,7 @@ pub mod stv {
 /// is never empty, but `new` rejects it when this module is not compiled in.
 #[cfg(feature = "sequential-irv")]
 pub mod sequential_irv {
-    use super::irv::{run_irv, Round as IrvRound};
+    use super::irv::{Round as IrvRound, run_irv};
 
     /// One seat's election: the winner (if any) and the IRV sub-rounds that elected them.
     pub struct Seat {
@@ -568,11 +569,12 @@ pub mod ranked_voting {
         /// - `mint_statement`: Built off-chain by the initiator's wallet. Must carry exactly
         ///   `voter_count` as its revealed input amount and one stealth output per voter.
         ///
-        /// The caller of `new` is the initiator: only they may end the vote. No template fields
-        /// need to be edited before publishing — the initiator's key is captured from the
-        /// transaction here, and the ballot supply is permanently capped at `voter_count`: the
-        /// mint rule of the ballot resource requires a proof of a one-of badge that is sealed in
-        /// the component by this call, so no further ballots can ever be minted.
+        /// The caller of `new` is the initiator: before the deadline only they may end the vote;
+        /// after the deadline anyone may finalize it. No template fields need to be edited before
+        /// publishing — the initiator's key is captured from the transaction here, and the ballot
+        /// supply is permanently capped at `voter_count`: the mint rule of the ballot resource
+        /// requires a proof of a one-of badge that is sealed in the component by this call, so no
+        /// further ballots can ever be minted.
         pub fn new(
             alloc: ResourceAddressAllocation,
             voter_count: u64,
@@ -606,9 +608,9 @@ pub mod ranked_voting {
                 "MultiWinnerMethod::SequentialIrv requires the `sequential-irv` feature (build with `--features sequential-irv`)",
             );
 
-            // The caller of `new` is the initiator: they may burn ballots and end the vote.
-            // Capturing the key here instead of hard-coding placeholders means nothing needs to
-            // be edited before publishing.
+            // The caller of `new` is the initiator: their key gates ending the vote before the
+            // deadline. Capturing the key here instead of hard-coding placeholders means nothing
+            // needs to be edited before publishing.
             let initiator = CallerContext::transaction_signer_public_key();
 
             // The ballot resource's mint rule requires a proof of a one-of NFT badge that is
@@ -636,7 +638,7 @@ pub mod ranked_voting {
                 .with_divisibility(0)
                 .with_owner_rule(OwnerRule::None)
                 .mintable(rule!(resource(mint_badge_resource)), LOCKED)
-                .burnable(rule!(public_key(initiator)), LOCKED)
+                .burnable(rule!(deny_all), LOCKED)
                 .with_address_allocation(alloc)
                 .build();
 
@@ -668,11 +670,13 @@ pub mod ranked_voting {
             .with_access_rules(
                 AccessRules::new()
                     // Initiator-only: the caller of `new` is the initiator, and their key (see
-                    // above) is the only one that may end the vote. Voter confidentiality does
-                    // not depend on this gate — even a compromised initiator key cannot inflate
-                    // the ballot supply, which the sealed mint badge caps.
+                    // above) is the only one that may end a live vote. After the deadline anyone
+                    // may finalize via `end_vote_expired`, so an absent initiator cannot hold up
+                    // finalization. Voter confidentiality does not depend on this gate — even a
+                    // compromised initiator key cannot inflate the ballot supply, which the
+                    // sealed mint badge caps.
                     .method("end_vote", rule!(public_key(initiator)))
-                    .method("end_vote_expired", rule!(public_key(initiator)))
+                    .method("end_vote_expired", rule!(allow_all))
                     // cast_ballot / result / ballot_count / resource_address are callable by
                     // anyone; they deliberately do NOT call
                     // CallerContext::transaction_signer_public_key() so that voters' transactions
@@ -868,10 +872,11 @@ pub mod ranked_voting {
             result
         }
 
-        /// End the vote after the voting period has expired (initiator-only), even if not all
-        /// eligible voters cast ballots. This prevents an election from being held up
-        /// indefinitely by non-voting participants. The tally is computed with whatever ballots
-        /// were actually cast, using the same dispatch as `end_vote`.
+        /// End the vote after the voting period has expired (callable by anyone), even if not
+        /// all eligible voters cast ballots. This prevents an election from being held up
+        /// indefinitely by non-voting participants — or by an initiator who never returns to
+        /// finalize it. The tally is computed with whatever ballots were actually cast, using
+        /// the same dispatch as `end_vote`.
         pub fn end_vote_expired(&mut self) -> VoteResult {
             assert!(self.active, "No active vote");
             let current_epoch = Consensus::current_epoch();
