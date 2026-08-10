@@ -1,14 +1,12 @@
 use ranked_voting::MultiWinnerMethod;
 use ranked_voting::irv::run_irv;
-use tari_template_lib::prelude::{Amount, rule};
+use tari_template_lib::prelude::Amount;
 use tari_template_lib::types::SubstateOwnerRule;
 use tari_template_lib::types::access_rules::{
     AccessRule, RequireRule, ResourceAuthAction, RestrictedAccessRule, RuleRequirement, UpdateRule,
 };
 use tari_template_lib::types::constants::TARI_TOKEN;
 use tari_template_test_tooling::TemplateTest;
-use tari_template_test_tooling::byte_type::ToByteType;
-use tari_template_test_tooling::crypto::{PublicKey, RistrettoPublicKey};
 use tari_template_test_tooling::engine_types::virtual_substate::{
     VirtualSubstate, VirtualSubstateId,
 };
@@ -602,8 +600,29 @@ fn rejects_end_vote_expired_before_deadline() {
 }
 
 #[test]
+fn anyone_can_finalize_expired_vote() {
+    let (component, _ballot_resource, mut test, _account, _proof, _secret) =
+        create_vote(1, 2, 1, MultiWinnerMethod::SequentialIrv, 0);
+
+    // Advance the epoch past the expiration, so the vote is finalizable.
+    test.set_virtual_substate(
+        VirtualSubstateId::CurrentEpoch,
+        VirtualSubstate::CurrentEpoch(1),
+    );
+
+    // A fresh account (not the initiator) can finalize the expired vote — `end_vote_expired` is
+    // open to anyone, and the method's own assert verifies the deadline has passed.
+    let (_other_account, _other_proof, other_secret) = test.create_funded_account();
+    let transaction = test
+        .transaction()
+        .call_method(component, "end_vote_expired", args![])
+        .build_and_seal(&other_secret);
+    test.execute_expect_success(transaction, vec![]);
+}
+
+#[test]
 fn ballot_minting_is_permanently_revoked() {
-    let (component, ballot_resource, test, _account, _proof, secret) =
+    let (component, ballot_resource, test, _account, _proof, _secret) =
         create_vote(3, 2, 1, MultiWinnerMethod::SequentialIrv, 1000);
 
     // The one-of mint badge is sealed inside the component; it is the component vault that does
@@ -637,16 +656,14 @@ fn ballot_minting_is_permanently_revoked() {
         other => panic!("unexpected ballot mint rule: {other:?}"),
     }
     // The ballot resource is ownerless, so the resource-owner authorization path (which would
-    // bypass the mint rule) is closed. Burning ballots requires the initiator's key — the caller
-    // of `new`, captured from the transaction at construction — so only they can burn; the
-    // withdraw rule stays allow_all because the constructor's mint-to-stealth conversion is
-    // authorized by it, but no template method ever exposes a ballot vault to callers, so it is
-    // inert.
+    // bypass the mint rule) is closed. Burning ballots is denied outright (no one — including
+    // the initiator — can ever burn ballot tokens); the withdraw rule stays allow_all because
+    // the constructor's mint-to-stealth conversion is authorized by it, but no template method
+    // ever exposes a ballot vault to callers, so it is inert.
     assert_eq!(ballot_def.owner_rule(), &SubstateOwnerRule::None);
-    let initiator = RistrettoPublicKey::from_secret_key(&secret).to_byte_type();
     assert_eq!(
         ballot_rules.get_access_rule(&ResourceAuthAction::Burn),
-        &rule!(public_key(initiator)),
+        &AccessRule::DenyAll,
     );
     assert!(matches!(
         ballot_rules.get_updater(&ResourceAuthAction::Burn),

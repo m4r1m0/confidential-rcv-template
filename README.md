@@ -92,7 +92,7 @@ For those who prefer proportional representation, the template also supports **s
 
 Elections have an `expires_at_epoch` deadline set at initiation. After the deadline, no more ballots may be cast (`cast_ballot` checks `Consensus::current_epoch()`). This prevents an election from being held up indefinitely by voters who never spend their stealth ballot tokens.
 
-After expiration, `end_vote_expired()` finalizes the tally with whatever ballots were actually cast.
+After expiration, `end_vote_expired()` finalizes the tally with whatever ballots were actually cast. It is callable by anyone, so the election cannot be held up by an initiator who never returns; the initiator can also use it.
 
 ## Template API
 
@@ -106,16 +106,16 @@ After expiration, `end_vote_expired()` finalizes the tally with whatever ballots
 | `ballot_vault_balance()` | allow_all | Returns the ballot pool vault balance (cross-check: equals `ballot_count`). |
 | `result()` | allow_all | Computes the tally: IRV when `num_winners = 1`, otherwise the `MultiWinnerMethod` chosen in `new`. Read-only. Returns a `VoteResult`. |
 | `end_vote()` | initiator-only | Ends the vote, returns the final `VoteResult`, locks further ballots. |
-| `end_vote_expired()` | initiator-only | Finalizes an expired election with the final `VoteResult` (even if not all ballots cast). |
+| `end_vote_expired()` | anyone (after the deadline) | Finalizes an expired election with the final `VoteResult` (even if not all ballots cast). |
 
-The initiator is whoever called `new()` — no keys need to be edited before publishing. Anyone else calling `end_vote()` / `end_vote_expired()` is rejected by the component's access rules. Voter confidentiality does not depend on this gate (ballots are identity-free regardless); it exists so only the vote's creator can end it.
+The initiator is whoever called `new()` — no keys need to be edited before publishing. Only the initiator can end a live vote; anyone can finalize it once the deadline has passed, so an absent initiator cannot hold up finalization. Voter confidentiality does not depend on this gate (ballots are identity-free regardless); it exists so only the vote's creator can close it early.
 
 ## Project layout
 
 ```
 templates/ranked_voting/         The template (Rust → WASM)
   src/lib.rs                     Template + pure IRV (pub mod irv) + STV (pub mod stv, `stv` feature) + sequential IRV (pub mod sequential_irv, `sequential-irv` feature)
-  tests/test.rs                  Unit + adversarial in-process tests (feature-dependent, ~35 with defaults)
+  tests/test.rs                  Unit + adversarial in-process tests (feature-dependent, ~36 with defaults)
 client/integration/              3-voter end-to-end test (IRV with redistribution)
 vendor/tari-ootle/               Git submodule: fork of tari-ootle with the two-input signing fix
 ```
