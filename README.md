@@ -115,8 +115,8 @@ The initiator is whoever called `new()` — no keys need to be edited before pub
 ```
 templates/ranked_voting/         The template (Rust → WASM)
   src/lib.rs                     Template + pure IRV (pub mod irv) + STV (pub mod stv, `stv` feature) + sequential IRV (pub mod sequential_irv, `sequential-irv` feature)
-  tests/test.rs                  Unit + adversarial in-process tests (feature-dependent, ~36 with defaults)
-client/integration/              3-voter end-to-end test (IRV with redistribution)
+  tests/test.rs                  Unit + adversarial + end-to-end in-process tests (feature-dependent, ~39 with defaults)
+client/integration/             3-voter end-to-end test on the Esmeralda testnet (IRV with redistribution; for primary testing see tests/test.rs, which covers the same scenario in-process)
 vendor/tari-ootle/               Git submodule: fork of tari-ootle with the two-input signing fix
 ```
 
