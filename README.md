@@ -117,18 +117,11 @@ templates/ranked_voting/         The template (Rust → WASM)
   src/lib.rs                     Template + pure IRV (pub mod irv) + STV (pub mod stv, `stv` feature) + sequential IRV (pub mod sequential_irv, `sequential-irv` feature)
   tests/test.rs                  Unit + adversarial + end-to-end in-process tests (feature-dependent, ~39 with defaults)
 client/integration/             3-voter end-to-end test on the Esmeralda testnet (IRV with redistribution; for primary testing see tests/test.rs, which covers the same scenario in-process)
-vendor/tari-ootle/               Git submodule: fork of tari-ootle with the two-input signing fix
 ```
 
 ## Build
 
 ```bash
-# Clone with submodules (includes the patched ootle-rs fork)
-git clone --recurse-submodules https://github.com/m4r1m0/confidential-rcv-template.git
-
-# If already cloned, initialize the submodule:
-git submodule update --init --recursive
-
 # Compile the template to WASM (all methods)
 cargo build --target wasm32-unknown-unknown --release -p ranked_voting
 
@@ -179,14 +172,8 @@ This runs a full 3-voter ranked-choice scenario on the Esmeralda testnet:
 - Three voter wallets each faucet, convert TARI to a stealth UTXO for fees, then cast a private ballot via a two-input stealth spend (ballot UTXO → `cast_ballot`, TARI UTXO → fee) with their ranking.
 - `end_vote()` returns the IRV result: **candidate 2 wins in 2 rounds** (no first-round majority → candidate 0 eliminated → ballot redistributes to candidate 2 → majority).
 
-## The ootle-rs signing fix
+## Stealth auth signatures commit to the sealing one-time key
 
-The `vendor/tari-ootle` submodule is a fork of [tari-ootle](https://github.com/tari-project/tari-ootle) containing a fix for a **two-stealth-input signing bug** in `crates/wallet/ootle-rs/src/wallet/stealth.rs` (`WalletStealthAuthorizer::create_authorizations`).
+The private two-input ballot spend relies on **stealth authorization signatures committing to the seal signer's one-time key (P)**, not the account key (K): the engine verifies every authorization against `seal_signature().public_key()`, which for a stealth-sealed transaction is the one-time key derived from the seal input's sender nonce. Binding authorizations to K instead produces an "Invalid transaction signature" as soon as a second stealth input needs an authorization — invisible with a single stealth input (no authorizations are produced), which is why it went unnoticed upstream.
 
-**The bug:** The engine verifies every authorization signature against the seal signature's public key. For account-sealed transactions that is the account key (K); for stealth-sealed transactions it is the seal signer's *one-time* key (P), **not** the account key. The upstream implementation always bound authorizations to K, which is invisible with a single stealth input (no authorizations needed) but produces an invalid signature as soon as a second stealth input requires an authorization signature.
-
-**The fix:** When the transaction is stealth-sealed (`must_sign_with_account_key == false`), derive the one-time stealth owner public key P via `derive_stealth_owner_public_key(seal_signer.signer(), seal_signer.public_nonce())` and bind authorization signatures to P instead of K.
-
-This fix is what makes the private two-input ballot spend possible: the ballot-token UTXO is the seal input (P_seal), and the TARI fee UTXO is an additional authorization — both signed correctly against the one-time key.
-
-The fix is applied via a `[patch.crates-io]` override in the workspace `Cargo.toml`, pointing at the submodule fork. Once the upstream PR ([tari-project/tari-ootle#2390](https://github.com/tari-project/tari-ootle/pull/2390)) is merged, the patch section and submodule can be removed.
+An earlier fix for this, [tari-project/tari-ootle#2390](https://github.com/tari-project/tari-ootle/pull/2390), was superseded by a fuller rework ([#2403](https://github.com/tari-project/tari-ootle/pull/2403), released in `ootle-rs` 0.18.0): signature requirements now resolve the seal source once (`SignatureRequirements::stealth_seal_with(seal_signer, authorizers)` — the ballot UTXO seals, the TARI fee UTXO authorizes), the seal key is derivable before signing, and `TransactionRequest::build()` asks the authorizer for the authorizations its inputs require before sealing. No patching or vendoring is needed — the crates.io dependencies carry the fix.

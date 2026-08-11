@@ -86,12 +86,18 @@ async fn faucet(provider: &mut Provider, label: &str) -> Result<()> {
     wait_for_commit(&provider.send_transaction(tx).await?, "faucet").await
 }
 
+/// Publish fee for the publish step. Unused fee is refunded, so overpaying costs nothing; the
+/// required fee scales with WASM size (the current 368 KB build needs ~11.5M). If publishing
+/// starts failing with `OnlyFeeCommit(InsufficientFeesPaid("Required fees X but Y paid"))`,
+/// bump this to comfortably exceed X.
+const PUBLISH_FEE: u64 = 20_000_000;
+
 async fn publish_template(provider: &mut Provider) -> Result<TemplateAddress> {
     print!("\n[Publish] template... ");
     let wasm = std::fs::read(WASM_PATH).with_context(|| format!("read {WASM_PATH}"))?;
     let unsigned = IAccount::new(provider)
         .publish_template(wasm)
-        .pay_fee(10_000_000u64)
+        .pay_fee(PUBLISH_FEE)
         .prepare()
         .await?;
     let tx = TransactionRequest::default()
@@ -189,12 +195,19 @@ async fn create_and_initiate_vote(
         .iter()
         .find_map(|s| s.substate_id.as_component_address())
         .context("no component addr")?;
+    // The template creates two resources: RVOTE-MINT (NonFungible, ballot records) and RVOTE
+    // (Stealth, the ballots themselves). The mint statement commits to the stealth resource, so
+    // pick it out of the `resource.create` events rather than guessing from the diff order.
     let ballot_resource = receipt
-        .diff_summary
-        .upped
+        .events
         .iter()
-        .find_map(|s| s.substate_id.as_resource_address().filter(|a| *a != TARI_TOKEN))
-        .context("no resource addr")?;
+        .find(|event| {
+            event.topic() == "std.resource.create"
+                && event.get_payload("resource_type") == Some("Stealth")
+        })
+        .and_then(|event| event.substate_id())
+        .and_then(|s| s.as_resource_address())
+        .context("no ballot resource addr")?;
     println!("  component: {component}\n  ballot resource: {ballot_resource}");
     Ok((component, ballot_resource, ballot_utxos))
 }
@@ -284,10 +297,12 @@ async fn cast_private_ballot(
 
     let ballot_signer = StealthSignerRequirement::new(voter_address.clone(), ballot_nonce);
     let tari_signer = StealthSignerRequirement::new(voter_address.clone(), tari_nonce);
-    let mut signers = IndexSet::new();
-    signers.insert(tari_signer);
+    let mut authorizers = IndexSet::new();
+    authorizers.insert(tari_signer);
+    // The ballot-token UTXO seals the transaction (its one-time key P is the seal key) and the
+    // stealth TARI fee UTXO authorizes against it.
     let signature_requirements =
-        SignatureRequirements::new_opt_with_seal_signer(signers, Some(ballot_signer));
+        SignatureRequirements::stealth_seal_with(ballot_signer, authorizers);
 
     let unsigned = IComponent::new(provider)
         .want_all_vaults(component)
@@ -319,10 +334,10 @@ async fn cast_private_ballot(
     let adjusted_fee = estimated_fee * FEE_MARGIN_MULTIPLIER;
     println!("  dry-run fee: {estimated_fee}, adjusted: {adjusted_fee}");
 
-    let authorizations = authorizer.create_authorizations(&unsigned).await?;
+    // `build` asks the authorizer for the stealth authorization signatures its inputs require
+    // (committing to the seal signer's one-time public key) and seals the transaction.
     let tx = TransactionRequest::default()
         .with_transaction(unsigned)
-        .with_authorizations(authorizations)
         .build(&authorizer)
         .await?;
     wait_for_commit(&provider.send_transaction(tx).await?, "cast_ballot").await

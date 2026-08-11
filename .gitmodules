@@ -1,3 +1,0 @@
-[submodule "vendor/tari-ootle"]
-	path = vendor/tari-ootle
-	url = https://github.com/m4r1m0/tari-ootle.git
