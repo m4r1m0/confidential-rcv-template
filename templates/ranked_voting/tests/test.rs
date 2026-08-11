@@ -11,8 +11,11 @@ use tari_template_test_tooling::engine_types::virtual_substate::{
     VirtualSubstate, VirtualSubstateId,
 };
 use tari_template_test_tooling::support::assert_error::assert_reject_reason;
-use tari_template_test_tooling::support::stealth::generate_mint_statement;
-use tari_template_test_tooling::transaction::args;
+use tari_template_test_tooling::support::stealth::{
+    StealthSecretTransferData, generate_mint_statement, generate_transfer_data,
+};
+use tari_template_test_tooling::transaction::{Transaction, args};
+use tari_template_test_tooling::wallet_crypto::MaskAndValue;
 
 /// Helper: ballot `[a, b, c]` means a=1st choice, b=2nd, c=3rd.
 fn ballot(rank: &[u32]) -> Vec<u32> {
@@ -400,6 +403,14 @@ mod sequential_irv_tests {
 // call. Tests that check invalid parameters assert on the constructor itself; tests that need a
 // valid component use `create_vote` with valid params then exercise the post-creation methods.
 
+/// Builds the mint statement for `voter_count` amount-1 ballot UTXOs. The returned data keeps
+/// each UTXO's mask so tests can spend the UTXOs later (each ballot UTXO is a key-path output
+/// whose spend key is its mask).
+fn mint_ballots(voter_count: u64) -> StealthSecretTransferData {
+    let output_amounts: Vec<u64> = (0..voter_count).map(|_| 1).collect();
+    generate_mint_statement(output_amounts, 0u64, None)
+}
+
 /// Creates a RankedVote component with the given parameters and returns
 /// (component_address, ballot_resource_address, test, account, proof, secret).
 fn create_vote(
@@ -420,8 +431,7 @@ fn create_vote(
     let template_address = test.get_template_address("RankedVote");
     let (account, proof, secret) = test.create_funded_account();
 
-    let output_amounts: Vec<u64> = (0..voter_count).map(|_| 1).collect();
-    let mint_data = generate_mint_statement(output_amounts, 0u64, None);
+    let mint_data = mint_ballots(voter_count);
 
     let transaction = test
         .transaction()
@@ -485,8 +495,7 @@ fn create_vote_expect_failure(
     let template_address = test.get_template_address("RankedVote");
     let (_account, _proof, secret) = test.create_funded_account();
 
-    let output_amounts: Vec<u64> = (0..voter_count).map(|_| 1).collect();
-    let mint_data = generate_mint_statement(output_amounts, 0u64, None);
+    let mint_data = mint_ballots(voter_count);
 
     let transaction = test
         .transaction()
@@ -703,6 +712,123 @@ fn ballot_minting_is_permanently_revoked() {
     assert_eq!(ballot_def.total_supply(), Some(Amount::from(3u64)));
     let voter_count: u64 = test.extract_component_value(component, "8");
     assert_eq!(voter_count, 3);
+}
+
+// ───────────────────── End-to-end stealth-ballot election ─────────────────────
+//
+// Mirrors the testnet scenario in `client/integration/src/main.rs` entirely in-process
+// (no testnet needed): the vote is created, each voter spends their stealth ballot UTXO
+// into `cast_ballot`, and `end_vote` produces the expected IRV winner. The test works in
+// every feature build because a single-winner election always takes the IRV path.
+
+#[test]
+fn end_to_end_three_voter_election() {
+    let mut test = TemplateTest::my_crate();
+    let template_address = test.get_template_address("RankedVote");
+    let (_account, proof, secret) = test.create_funded_account();
+
+    // Same scenario as the integration client: 3 voters, 3 candidates, 1 winner.
+    let rankings: [[u32; 3]; 3] = [[0, 2, 1], [1, 2, 0], [2, 0, 1]];
+
+    // Create the vote; the constructor mints one amount-1 ballot UTXO per voter.
+    let ballot_mint = mint_ballots(3);
+    let transaction = test
+        .transaction()
+        .allocate_resource_address("ballot_res")
+        .call_function(
+            template_address,
+            "new",
+            args![
+                Workspace("ballot_res"),
+                3u64,
+                3u32,
+                1u32,
+                MultiWinnerMethod::SequentialIrv,
+                1000u64,
+                ballot_mint.statement,
+            ],
+        )
+        .build_and_seal(&secret);
+    let result = test.execute_expect_success(transaction, vec![proof.clone()]);
+    let component = result
+        .finalize
+        .result
+        .accept()
+        .unwrap()
+        .up_iter()
+        .find_map(|(id, _)| id.as_component_address())
+        .expect("component address");
+    // The ballot resource is the stealth resource that is not the test tooling's TARI token.
+    let ballot_resource = test
+        .read_only_state_store()
+        .get_all_resources()
+        .expect("resources")
+        .into_iter()
+        .find(|(address, resource)| resource.resource_type().is_stealth() && *address != TARI_TOKEN)
+        .map(|(address, _)| address)
+        .expect("ballot resource");
+
+    // Each voter spends their ballot UTXO directly into `cast_ballot`: the UTXO is a
+    // key-path output whose spend key is its mask, so the spend transaction is signed with
+    // the mask (the canonical in-process stealth-spend pattern).
+    for (i, ranking) in rankings.iter().enumerate() {
+        let ballot_spend = generate_transfer_data(
+            [MaskAndValue {
+                mask: ballot_mint.output_masks[i].clone(),
+                value: 1,
+            }],
+            0u64,
+            Vec::<u64>::new(),
+            1u64,
+        );
+        let transaction = Transaction::builder_localnet()
+            .stealth_transfer(ballot_resource, ballot_spend.statement)
+            .put_last_instruction_output_on_workspace("vote")
+            .call_method(component, "cast_ballot", args![Workspace("vote"), ranking.to_vec()])
+            .finish()
+            .add_signer(&test.to_public_key_bytes(), &ballot_mint.output_masks[i])
+            .seal(test.secret_key());
+        test.execute_expect_success(transaction, vec![]);
+    }
+
+    // A stealth UTXO can only be spent once: re-spending voter 0's ballot must fail.
+    let double_spend = generate_transfer_data(
+        [MaskAndValue {
+            mask: ballot_mint.output_masks[0].clone(),
+            value: 1,
+        }],
+        0u64,
+        Vec::<u64>::new(),
+        1u64,
+    );
+    let transaction = Transaction::builder_localnet()
+        .stealth_transfer(ballot_resource, double_spend.statement)
+        .put_last_instruction_output_on_workspace("vote")
+        .call_method(
+            component,
+            "cast_ballot",
+            args![Workspace("vote"), rankings[0].to_vec()],
+        )
+        .finish()
+        .add_signer(&test.to_public_key_bytes(), &ballot_mint.output_masks[0])
+        .seal(test.secret_key());
+    test.execute_expect_failure(transaction, vec![]);
+
+    // End the vote: round 1 ties 1-1-1, candidate 0 is eliminated (lowest id), and voter 0's
+    // second choice gives candidate 2 a 2/3 majority — the same expected winner as the
+    // integration client.
+    let transaction = test
+        .transaction()
+        .call_method(component, "end_vote", args![])
+        .build_and_seal(&secret);
+    let result = test.execute_expect_success(transaction, vec![]);
+    let result_event = result
+        .finalize
+        .events
+        .iter()
+        .find(|event| event.topic().ends_with(".Result"))
+        .expect("IRV tally event");
+    assert_eq!(result_event.payload().get("winner"), Some("2"));
 }
 
 // ───────────────────── Method dispatch tests ─────────────────────
