@@ -26,18 +26,20 @@ use ootle_rs::{
     transaction::TransactionSigner,
     wallet::OotleWallet,
 };
+use ranked_voting::MultiWinnerMethod;
 use std::num::NonZeroU64;
 use std::time::Duration;
 use tari_crypto::ristretto::RistrettoPublicKey;
 use tari_ootle_transaction::args;
-use ranked_voting::MultiWinnerMethod;
 
-const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/ranked_voting.wasm";
+// Publish the minified artifact produced by `scripts/minify-wasm.sh` (the default build,
+// with the full method set) — ~308 KB after wasm-opt -Oz vs ~368 KB raw.
+const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm";
 const VOTER_COUNT: usize = 3;
 const NUM_CANDIDATES: u32 = 3;
 const NUM_WINNERS: u32 = 1;
 const EXPIRES_AT_EPOCH: u64 = 100_000;
-const CONVERT_AMOUNT: u64 = 1 * TARI;
+const CONVERT_AMOUNT: u64 = TARI;
 const VOTE_FEE: u64 = 50_000;
 /// Multiplier applied to dry-run fee estimates to avoid underpayment from estimation variance.
 const FEE_MARGIN_MULTIPLIER: u64 = 2;
@@ -50,11 +52,8 @@ const FEE_MARGIN_MULTIPLIER: u64 = 2;
 /// Round 1: 0=1, 1=1, 2=1. No majority. Eliminate 0 (lowest id tie-break).
 /// Round 2: 1=1, 2=2 (voter 0's 2nd choice redistributes to 2). 2/3 = 67% > 50%.
 /// Winner: candidate 2.
-const VOTER_RANKINGS: [[u32; NUM_CANDIDATES as usize]; VOTER_COUNT] = [
-    [0, 2, 1],
-    [1, 2, 0],
-    [2, 0, 1],
-];
+const VOTER_RANKINGS: [[u32; NUM_CANDIDATES as usize]; VOTER_COUNT] =
+    [[0, 2, 1], [1, 2, 0], [2, 0, 1]];
 const EXPECTED_WINNER: u32 = 2;
 
 type Provider = IndexerProvider<OotleWallet>;
@@ -87,7 +86,7 @@ async fn faucet(provider: &mut Provider, label: &str) -> Result<()> {
 }
 
 /// Publish fee for the publish step. Unused fee is refunded, so overpaying costs nothing; the
-/// required fee scales with WASM size (the current 368 KB build needs ~11.5M). If publishing
+/// required fee scales with WASM size (the minified ~308 KB build needs ~9.6M). If publishing
 /// starts failing with `OnlyFeeCommit(InsufficientFeesPaid("Required fees X but Y paid"))`,
 /// bump this to comfortably exceed X.
 const PUBLISH_FEE: u64 = 20_000_000;
@@ -122,7 +121,11 @@ async fn create_and_initiate_vote(
     provider: &mut Provider,
     template_address: TemplateAddress,
     voter_addresses: &[Address],
-) -> Result<(ComponentAddress, ResourceAddress, Vec<(PedersenCommitmentBytes, RistrettoPublicKey)>)> {
+) -> Result<(
+    ComponentAddress,
+    ResourceAddress,
+    Vec<(PedersenCommitmentBytes, RistrettoPublicKey)>,
+)> {
     print!("\n[Create + Initiate] vote... ");
     let voter_count = voter_addresses.len() as u64;
 
@@ -134,8 +137,10 @@ async fn create_and_initiate_vote(
     // a placeholder address here. The real resource address is bound when the engine executes
     // the stealth_transfer instruction inside the template's `new()` constructor, which
     // receives the allocated address via the ResourceAddressAllocation parameter.
-    let placeholder_resource = ResourceAddress::from_hex("0000000000000000000000000000000000000000000000000000000000000000")
-        .expect("valid placeholder resource address");
+    let placeholder_resource = ResourceAddress::from_hex(
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    )
+    .expect("valid placeholder resource address");
     let mut mint_builder =
         StealthTransfer::new(placeholder_resource, provider).spend_revealed_input(voter_count);
     for address in voter_addresses {
@@ -153,7 +158,7 @@ async fn create_and_initiate_vote(
         .stealth_outputs()
         .iter()
         .map(|utxo| {
-            let commitment = utxo.commitment().clone();
+            let commitment = *utxo.commitment();
             let nonce: RistrettoPublicKey = utxo
                 .output
                 .sender_public_nonce
@@ -231,7 +236,7 @@ async fn convert_to_stealth_tari(
         .await?;
 
     let tari_utxo = &convert_transfer.stealth_outputs()[0];
-    let tari_commitment = tari_utxo.commitment().clone();
+    let tari_commitment = *tari_utxo.commitment();
     let tari_nonce: RistrettoPublicKey = tari_utxo
         .output
         .sender_public_nonce
@@ -243,7 +248,11 @@ async fn convert_to_stealth_tari(
         .then(|builder| {
             builder.with_fee_instructions_builder(|fee_builder| {
                 fee_builder
-                    .call_method(voter_account, "withdraw", args![TARI_TOKEN, Amount::from(CONVERT_AMOUNT)])
+                    .call_method(
+                        voter_account,
+                        "withdraw",
+                        args![TARI_TOKEN, Amount::from(CONVERT_AMOUNT)],
+                    )
                     .put_last_instruction_output_on_workspace("withdrawn")
                     .stealth_transfer_with_input_bucket(TARI_TOKEN, convert_transfer, "withdrawn")
                     .put_last_instruction_output_on_workspace("fee_output")
@@ -266,6 +275,7 @@ async fn convert_to_stealth_tari(
 /// pattern for the README's fee-from-stealth requirement — the fee MUST come from a stealth
 /// TARI UTXO, never a revealed account, or the transaction links the voter's identity to
 /// their public ranking.
+#[allow(clippy::too_many_arguments)]
 async fn cast_private_ballot(
     provider: &mut Provider,
     component: ComponentAddress,
@@ -280,12 +290,12 @@ async fn cast_private_ballot(
     let tari_change = CONVERT_AMOUNT - VOTE_FEE - VOTE_FEE;
 
     let (ballot_spend, _) = StealthTransfer::new(ballot_resource, provider)
-        .spend_stealth_input(voter_address.clone(), ballot_commitment.clone())
+        .spend_stealth_input(voter_address.clone(), ballot_commitment)
         .to_revealed_output(1u64)
         .prepare()
         .await?;
     let (tari_spend, _) = StealthTransfer::new(TARI_TOKEN, provider)
-        .spend_stealth_input(voter_address.clone(), tari_commitment.clone())
+        .spend_stealth_input(voter_address.clone(), tari_commitment)
         .to_revealed_output(VOTE_FEE)
         .to_stealth_output(Output::new(
             voter_address.clone(),
@@ -394,15 +404,15 @@ async fn main() -> Result<()> {
         .collect();
     let voter_addresses: Vec<Address> = voter_wallets.iter().map(|(_, a)| a.clone()).collect();
 
-    let (component, ballot_resource, ballot_utxos) = create_and_initiate_vote(
-        &mut initiator_provider,
-        template_address,
-        &voter_addresses,
-    )
-    .await?;
+    let (component, ballot_resource, ballot_utxos) =
+        create_and_initiate_vote(&mut initiator_provider, template_address, &voter_addresses)
+            .await?;
 
     for (i, (commitment, _)) in ballot_utxos.iter().enumerate() {
-        println!("  voter {i} ballot UTXO commitment: {}", hex::encode(commitment));
+        println!(
+            "  voter {i} ballot UTXO commitment: {}",
+            hex::encode(commitment)
+        );
     }
 
     for (i, (wallet, voter_address)) in voter_wallets.into_iter().enumerate() {
@@ -413,7 +423,10 @@ async fn main() -> Result<()> {
 
         let mut voter_provider = ProviderBuilder::new()
             .wallet(wallet)
-            .connect_with_transaction_timeout(default_indexer_url(network), Duration::from_secs(120))
+            .connect_with_transaction_timeout(
+                default_indexer_url(network),
+                Duration::from_secs(120),
+            )
             .await?;
 
         faucet(&mut voter_provider, &format!("Voter {i}")).await?;
@@ -424,7 +437,7 @@ async fn main() -> Result<()> {
             component,
             ballot_resource,
             &voter_address,
-            ballot_commitment.clone(),
+            *ballot_commitment,
             ballot_nonce.clone(),
             tari_commitment,
             tari_nonce,
