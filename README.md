@@ -115,7 +115,7 @@ The initiator is whoever called `new()` — no keys need to be edited before pub
 ```
 templates/ranked_voting/         The template (Rust → WASM)
   src/lib.rs                     Template + pure IRV (pub mod irv) + STV (pub mod stv, `stv` feature) + sequential IRV (pub mod sequential_irv, `sequential-irv` feature)
-  tests/test.rs                  Unit + adversarial + end-to-end in-process tests (feature-dependent, 39 with defaults)
+  tests/test.rs                  Unit + adversarial + end-to-end in-process tests (feature-dependent, 40 with defaults)
 client/integration/             3-voter end-to-end test on the Esmeralda testnet (IRV with redistribution; for primary testing see tests/test.rs, which covers the same scenario in-process)
 ```
 
@@ -176,6 +176,9 @@ The matching test command for each option uses the same feature flags, e.g.
 `cargo test -p ranked_voting --no-default-features --features stv`.
 
 ## Run the integration test
+
+First run `./scripts/minify-wasm.sh` — the client publishes the minified artifact
+(`target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm`).
 
 ```bash
 cargo run --bin integration

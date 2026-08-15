@@ -28,9 +28,12 @@ if ! command -v wasm-opt >/dev/null 2>&1; then
     exit 1
 fi
 
-# Size budget (bytes) for the minified default build. Without optimization the default
-# build is ~367 KB; wasm-opt -Oz brings it to ~250 KB (the size sdbondi's review
-# expected), and this gate leaves headroom for future growth.
+# Size budget (bytes) for the minified default build. Measured sizes (wasm-opt -Oz):
+#   default (all 3 methods) ~368 KB raw  -> ~308 KB minified
+#   IRV-only                 ~342 KB raw  -> ~286 KB minified
+# Review feedback expected ~250 KB for a scaffolded single-method template; the full
+# three-method bundle plus the template ABI carries the difference — per-method builds
+# (feature flags) get closest to that estimate. This gate leaves headroom for growth.
 SIZE_BUDGET=320000
 
 declare -a COMBOS
