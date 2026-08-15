@@ -398,8 +398,8 @@ mod sequential_irv_tests {
 // These test the template's assertion guards directly using tari_template_test_tooling
 // (in-process, no testnet needed). They cover the adversarial cases from review feedback:
 // wrong token type while the vote is active, expired election, vote closed after
-// finalization, double-vote amount, nonsense parameters, and invalid rankings (wrong
-// length / out-of-range candidate / duplicate candidate).
+// finalization, ballot amounts other than one token, nonsense parameters, and invalid
+// rankings (wrong length / out-of-range candidate / duplicate candidate).
 //
 // Each test creates the component with the vote parameters in one `call_function("new", ...)`
 // call. Tests that check invalid parameters assert on the constructor itself; tests that need a
@@ -410,6 +410,12 @@ mod sequential_irv_tests {
 /// whose spend key is its mask).
 fn mint_ballots(voter_count: u64) -> StealthSecretTransferData {
     let output_amounts: Vec<u64> = (0..voter_count).map(|_| 1).collect();
+    mint_ballots_with_amounts(output_amounts)
+}
+
+/// Like `mint_ballots`, but with the given per-output amounts. The returned data keeps each
+/// UTXO's mask so tests can spend the UTXOs later.
+fn mint_ballots_with_amounts(output_amounts: Vec<u64>) -> StealthSecretTransferData {
     generate_mint_statement(output_amounts, 0u64, None)
 }
 
@@ -688,6 +694,79 @@ fn rejects_invalid_ranking() {
         let reject = test.execute_expect_failure(transaction, vec![]);
         assert_reject_reason(reject, reason);
     }
+}
+
+#[test]
+fn rejects_ballot_must_be_exactly_one_token() {
+    let mut test = TemplateTest::my_crate();
+    let template_address = test.get_template_address("RankedVote");
+    let (_account, _proof, secret) = test.create_funded_account();
+
+    // Mint a single 2-token ballot output — only the amount differs from the standard
+    // amount-1 ballots. The constructor only validates that the minted total equals
+    // voter_count, so voter_count is 2 here; the cast-time guard is the enforcement
+    // point this test targets. The vote is created manually so the mint statement
+    // (and the output's mask) is available for the spend below.
+    let ballot_mint = mint_ballots_with_amounts(vec![2u64]);
+    let transaction = test
+        .transaction()
+        .allocate_resource_address("ballot_res")
+        .call_function(
+            template_address,
+            "new",
+            args![
+                Workspace("ballot_res"),
+                2u64,
+                2u32,
+                1u32,
+                MultiWinnerMethod::SequentialIrv,
+                1000u64,
+                ballot_mint.statement,
+            ],
+        )
+        .build_and_seal(&secret);
+    let result = test.execute_expect_success(transaction, vec![]);
+    let component = result
+        .finalize
+        .result
+        .accept()
+        .unwrap()
+        .up_iter()
+        .find_map(|(id, _)| id.as_component_address())
+        .expect("component address");
+    let ballot_resource = test
+        .read_only_state_store()
+        .get_all_resources()
+        .expect("resources")
+        .into_iter()
+        .find(|(address, resource)| resource.resource_type().is_stealth() && *address != TARI_TOKEN)
+        .map(|(address, _)| address)
+        .expect("ballot resource");
+
+    // Spend the 2-token ballot UTXO into `cast_ballot` with a valid ranking. The resource
+    // check passes (it is a ballot token); the amount assert fires.
+    let ballot_spend = generate_transfer_data(
+        [MaskAndValue {
+            mask: ballot_mint.output_masks[0].clone(),
+            value: 2,
+        }],
+        0u64,
+        Vec::<u64>::new(),
+        2u64,
+    );
+    let transaction = Transaction::builder_localnet()
+        .stealth_transfer(ballot_resource, ballot_spend.statement)
+        .put_last_instruction_output_on_workspace("vote")
+        .call_method(
+            component,
+            "cast_ballot",
+            args![Workspace("vote"), vec![0u32, 1u32]],
+        )
+        .finish()
+        .add_signer(&test.to_public_key_bytes(), &ballot_mint.output_masks[0])
+        .seal(test.secret_key());
+    let reject = test.execute_expect_failure(transaction, vec![]);
+    assert_reject_reason(reject, "each ballot must be exactly one token");
 }
 
 #[test]
