@@ -397,7 +397,9 @@ mod sequential_irv_tests {
 //
 // These test the template's assertion guards directly using tari_template_test_tooling
 // (in-process, no testnet needed). They cover the adversarial cases from review feedback:
-// wrong token type, double-vote amount, expired election, nonsense parameters, invalid rankings.
+// wrong token type while the vote is active, expired election, vote closed after
+// finalization, double-vote amount, nonsense parameters, and invalid rankings (wrong
+// length / out-of-range candidate / duplicate candidate).
 //
 // Each test creates the component with the vote parameters in one `call_function("new", ...)`
 // call. Tests that check invalid parameters assert on the constructor itself; tests that need a
@@ -594,6 +596,101 @@ fn rejects_ballot_after_expiration() {
 }
 
 #[test]
+fn rejects_wrong_token_while_vote_active() {
+    let (component, _ballot_resource, mut test, account, proof, secret) =
+        create_vote(1, 2, 1, MultiWinnerMethod::SequentialIrv, 1000);
+
+    // The vote is live and unexpired, so the active and expiration checks pass and the
+    // resource check fires: the bucket must hold the ballot token, not TARI.
+    let transaction = test
+        .transaction()
+        .call_method(account, "withdraw", args![TARI_TOKEN, Amount::from(1u64)])
+        .put_last_instruction_output_on_workspace("bucket")
+        .call_method(
+            component,
+            "cast_ballot",
+            args![Workspace("bucket"), vec![0u32, 1u32]],
+        )
+        .build_and_seal(&secret);
+
+    let reason = test.execute_expect_failure(transaction, vec![proof]);
+    assert_reject_reason(reason, "bucket must be the ballot resource");
+}
+
+#[test]
+fn rejects_invalid_ranking() {
+    let mut test = TemplateTest::my_crate();
+    let template_address = test.get_template_address("RankedVote");
+    let (_account, _proof, secret) = test.create_funded_account();
+
+    // Create the vote manually (rather than via `create_vote`) so the ballot mint
+    // statement — and therefore each UTXO's mask — is available for the spend below.
+    let ballot_mint = mint_ballots(1);
+    let transaction = test
+        .transaction()
+        .allocate_resource_address("ballot_res")
+        .call_function(
+            template_address,
+            "new",
+            args![
+                Workspace("ballot_res"),
+                1u64,
+                2u32,
+                1u32,
+                MultiWinnerMethod::SequentialIrv,
+                1000u64,
+                ballot_mint.statement,
+            ],
+        )
+        .build_and_seal(&secret);
+    let result = test.execute_expect_success(transaction, vec![]);
+    let component = result
+        .finalize
+        .result
+        .accept()
+        .unwrap()
+        .up_iter()
+        .find_map(|(id, _)| id.as_component_address())
+        .expect("component address");
+    let ballot_resource = test
+        .read_only_state_store()
+        .get_all_resources()
+        .expect("resources")
+        .into_iter()
+        .find(|(address, resource)| resource.resource_type().is_stealth() && *address != TARI_TOKEN)
+        .map(|(address, _)| address)
+        .expect("ballot resource");
+
+    // Spend the ballot UTXO into `cast_ballot` with an invalid ranking. Failed
+    // transactions roll back, so the same UTXO/mask is re-used for every attempt:
+    // ranking with an out-of-range candidate id, duplicate candidate, wrong length.
+    for (ranking, reason) in [
+        (vec![2u32, 0u32], "candidate id 2 out of range"),
+        (vec![0u32, 0u32], "candidate 0 ranked twice"),
+        (vec![0u32], "ranking must list every candidate exactly once"),
+    ] {
+        let ballot_spend = generate_transfer_data(
+            [MaskAndValue {
+                mask: ballot_mint.output_masks[0].clone(),
+                value: 1,
+            }],
+            0u64,
+            Vec::<u64>::new(),
+            1u64,
+        );
+        let transaction = Transaction::builder_localnet()
+            .stealth_transfer(ballot_resource, ballot_spend.statement)
+            .put_last_instruction_output_on_workspace("vote")
+            .call_method(component, "cast_ballot", args![Workspace("vote"), ranking])
+            .finish()
+            .add_signer(&test.to_public_key_bytes(), &ballot_mint.output_masks[0])
+            .seal(test.secret_key());
+        let reject = test.execute_expect_failure(transaction, vec![]);
+        assert_reject_reason(reject, reason);
+    }
+}
+
+#[test]
 fn rejects_end_vote_expired_before_deadline() {
     let (component, _ballot_resource, mut test, _account, _proof, secret) =
         create_vote(1, 2, 1, MultiWinnerMethod::SequentialIrv, 100);
@@ -784,7 +881,11 @@ fn end_to_end_three_voter_election() {
         let transaction = Transaction::builder_localnet()
             .stealth_transfer(ballot_resource, ballot_spend.statement)
             .put_last_instruction_output_on_workspace("vote")
-            .call_method(component, "cast_ballot", args![Workspace("vote"), ranking.to_vec()])
+            .call_method(
+                component,
+                "cast_ballot",
+                args![Workspace("vote"), ranking.to_vec()],
+            )
             .finish()
             .add_signer(&test.to_public_key_bytes(), &ballot_mint.output_masks[i])
             .seal(test.secret_key());
