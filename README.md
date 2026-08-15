@@ -115,7 +115,7 @@ The initiator is whoever called `new()` — no keys need to be edited before pub
 ```
 templates/ranked_voting/         The template (Rust → WASM)
   src/lib.rs                     Template + pure IRV (pub mod irv) + STV (pub mod stv, `stv` feature) + sequential IRV (pub mod sequential_irv, `sequential-irv` feature)
-  tests/test.rs                  Unit + adversarial + end-to-end in-process tests (feature-dependent, ~39 with defaults)
+  tests/test.rs                  Unit + adversarial + end-to-end in-process tests (feature-dependent, 40 with defaults)
 client/integration/             3-voter end-to-end test on the Esmeralda testnet (IRV with redistribution; for primary testing see tests/test.rs, which covers the same scenario in-process)
 ```
 
@@ -140,10 +140,25 @@ voters. The default build includes everything:
 
 | Build command | Included methods | WASM size |
 |---|---|---|
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting` (default) | IRV + sequential IRV + STV | ~367 KB |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features` | IRV only | ~341 KB |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features stv` | IRV + STV | ~351 KB |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features sequential-irv` | IRV + sequential IRV | ~359 KB |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting` (default) | IRV + sequential IRV + STV | ~368 KB → ~308 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features` | IRV only | ~342 KB → ~286 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features stv` | IRV + STV | ~351 KB → ~294 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features sequential-irv` | IRV + sequential IRV | ~359 KB → ~301 KB (minified) |
+
+"Minified" is the raw release build run through `wasm-opt -Oz` (see below); exact sizes are
+printed by `scripts/minify-wasm.sh`, which fails the run if the minified default build
+exceeds 320 KB.
+
+### Publishing
+
+```bash
+./scripts/minify-wasm.sh   # builds all 4 combos, writes *.min.wasm artifacts, prints the size table
+```
+
+Publish the minified artifact (`target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm`
+for the default build) instead of the raw `.wasm`. The publish fee scales with WASM size —
+unused fee is refunded (see `PUBLISH_FEE` in `client/integration/src/main.rs`) — and a smaller
+artifact also downloads and instantiates faster for voters.
 
 If you strip methods out, the component API still works exactly the same — the only difference
 is which `MultiWinnerMethod` values `new()` accepts:
@@ -161,6 +176,9 @@ The matching test command for each option uses the same feature flags, e.g.
 `cargo test -p ranked_voting --no-default-features --features stv`.
 
 ## Run the integration test
+
+First run `./scripts/minify-wasm.sh` — the client publishes the minified artifact
+(`target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm`).
 
 ```bash
 cargo run --bin integration
