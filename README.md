@@ -37,6 +37,12 @@ The ballot supply is permanently capped at the initial `voter_count`; nobody —
 
 The cap is verifiable by anyone: `voter_count()` returns the number of ballots minted, `ballot_vault_balance()` returns the number cast, and the ballot resource's total supply never exceeds `voter_count`.
 
+### Mint-statement invariants
+
+`new()` verifies two things about the mint statement it receives: its revealed input total equals `voter_count`, and it creates exactly `voter_count` stealth outputs — one per voter. Individual ballot amounts are confidential (each sits inside a Pedersen commitment), so per-output amounts cannot be verified on-chain; with the total and output-count checks together, a statement buildable by the canonical client or standard tooling is forced to be one amount-1 ballot per voter. A ballot that is not exactly one token can never be cast (the `cast_ballot` amount guard) and can never be burned or transferred. The mint statement is a public argument of the initiating transaction, so scrutineers can audit exactly what was minted and to which addresses.
+
+One limitation cannot be fixed in the template: nothing on-chain can verify that the minted outputs are distributed to *distinct* voters (two amount-1 ballots could be addressed to the same person, leaving another voter with none). Voter identity and ballot assignment are off-chain; the initiating transaction's public mint statement is the audit point for that.
+
 ### Fee-from-stealth requirement (MUST)
 
 For a ballot to be truly unlinkable, the transaction fee must also be paid unlinkably. **Every ballot transaction MUST pay its fee from a stealth TARI UTXO.** Each voter converts revealed TARI into a stealth TARI UTXO first, then pays the ballot transaction's fee from that stealth UTXO (with change returned to another stealth UTXO).
@@ -140,10 +146,10 @@ voters. The default build includes everything:
 
 | Build command | Included methods | WASM size |
 |---|---|---|
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting` (default) | IRV + sequential IRV + STV | ~368 KB → ~308 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting` (default) | IRV + sequential IRV + STV | ~368 KB → ~309 KB (minified) |
 | `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features` | IRV only | ~342 KB → ~286 KB (minified) |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features stv` | IRV + STV | ~351 KB → ~294 KB (minified) |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features sequential-irv` | IRV + sequential IRV | ~359 KB → ~301 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features stv` | IRV + STV | ~352 KB → ~295 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features sequential-irv` | IRV + sequential IRV | ~360 KB → ~302 KB (minified) |
 
 "Minified" is the raw release build run through `wasm-opt -Oz` (see below); exact sizes are
 printed by `scripts/minify-wasm.sh`, which fails the run if the minified default build
