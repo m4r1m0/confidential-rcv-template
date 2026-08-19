@@ -33,7 +33,7 @@ use tari_crypto::ristretto::RistrettoPublicKey;
 use tari_ootle_transaction::args;
 
 // Publish the minified artifact produced by `scripts/minify-wasm.sh` (the default build,
-// with the full method set) — ~308 KB after wasm-opt -Oz vs ~368 KB raw.
+// with the full method set) — ~309 KB after wasm-opt -Oz vs ~368 KB raw.
 const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm";
 const VOTER_COUNT: usize = 3;
 const NUM_CANDIDATES: u32 = 3;
@@ -86,7 +86,7 @@ async fn faucet(provider: &mut Provider, label: &str) -> Result<()> {
 }
 
 /// Publish fee for the publish step. Unused fee is refunded, so overpaying costs nothing; the
-/// required fee scales with WASM size (the minified ~308 KB build needs ~9.6M). If publishing
+/// required fee scales with WASM size (the minified ~309 KB build needs ~9.6M). If publishing
 /// starts failing with `OnlyFeeCommit(InsufficientFeesPaid("Required fees X but Y paid"))`,
 /// bump this to comfortably exceed X.
 const PUBLISH_FEE: u64 = 20_000_000;
@@ -151,6 +151,14 @@ async fn create_and_initiate_vote(
         ));
     }
     let (mint_statement, _) = mint_builder.prepare().await?;
+
+    // The template asserts the same invariant at construction; check it here so a misconfigured
+    // builder fails fast before submitting an unrecoverable node transaction.
+    assert_eq!(
+        mint_statement.stealth_outputs().len() as u64,
+        voter_count,
+        "mint statement must create one stealth output per voter",
+    );
 
     // Capture each voter's (commitment, nonce) from the mint statement so voters can
     // spend their UTXOs later.
