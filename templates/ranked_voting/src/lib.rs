@@ -221,6 +221,11 @@ pub mod stv {
                 .collect();
 
             if !newly_elected.is_empty() {
+                // Snapshot the active set before removing the newly-elected candidates: the
+                // surplus transfer must check each ballot's top choice among the set that was
+                // active when the round's counts were computed, not the post-removal set.
+                let active_before: BTreeSet<u32> = active.iter().copied().collect();
+
                 // Elect all candidates who reached the quota this round.
                 for &candidate in &newly_elected {
                     elected.push(candidate);
@@ -228,8 +233,9 @@ pub mod stv {
                 }
 
                 // Transfer surplus from each newly-elected candidate to those ballots' next
-                // preferences. Each ballot assigned to an elected candidate has its weight
-                // scaled by surplus / count (the transfer fraction).
+                // preferences. Only ballots whose top active choice was this candidate (per the
+                // pre-removal set) are scaled by surplus / count (the transfer fraction);
+                // ballots whose top preference is still-active candidates keep their weight.
                 for &candidate in &newly_elected {
                     let candidate_count = counts.get(&candidate).copied().unwrap_or(0);
                     if candidate_count == 0 || quota == 0 {
@@ -238,14 +244,14 @@ pub mod stv {
                     let surplus = candidate_count - quota;
 
                     for ballot in &mut weighted_ballots {
-                        // Find if this ballot's top active preference was the elected candidate.
-                        let top_choice = ballot.ranking.iter().copied().find(|c| {
-                            // The candidate is no longer in active (we removed them), so check
-                            // if they were the ballot's highest-ranked among the pre-removal set.
-                            // We check against the elected candidate directly.
-                            *c == candidate
-                        });
-                        if top_choice.is_some() {
+                        // Each ballot is a full permutation, so `find` always lands on this
+                        // ballot's highest-ranked candidate that was active this round.
+                        let top_choice = ballot
+                            .ranking
+                            .iter()
+                            .copied()
+                            .find(|c| active_before.contains(c));
+                        if top_choice == Some(candidate) {
                             // Scale this ballot's weight by surplus / count.
                             ballot.weight = ballot.weight * surplus / candidate_count;
                         }
