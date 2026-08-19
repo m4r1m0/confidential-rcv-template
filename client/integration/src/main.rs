@@ -40,9 +40,11 @@ const NUM_CANDIDATES: u32 = 3;
 const NUM_WINNERS: u32 = 1;
 const EXPIRES_AT_EPOCH: u64 = 100_000;
 const CONVERT_AMOUNT: u64 = TARI;
+/// Fee paid per ballot from the stealth TARI UTXO. Bucket-paid fees are taken in full with
+/// no refund — the excess is burned to the fee pool (`pay_fee_from_bucket` has no refunds),
+/// so this is a flat overpay above the actual fee. The uniform amount is intentional: every
+/// ballot transaction reveals the same fee, keeping all ballot txns identical in shape.
 const VOTE_FEE: u64 = 50_000;
-/// Multiplier applied to dry-run fee estimates to avoid underpayment from estimation variance.
-const FEE_MARGIN_MULTIPLIER: u64 = 2;
 
 /// Each voter's ranking: a permutation of 0..NUM_CANDIDATES (index 0 = first choice).
 /// Scenario: 3 voters, 3 candidates.
@@ -344,13 +346,12 @@ async fn cast_private_ballot(
         .await?;
 
     let authorizer = provider.wallet().stealth_authorizer(signature_requirements);
+    // Preflight (kept intentionally): dry-run the exact unsigned transaction so a
+    // fee/invalidity failure aborts here, before spending real fees on-chain.
     let dry_run = provider
         .sign_and_send_dry_run_with(&authorizer, unsigned.clone())
         .await?;
     dry_run.expect_success();
-    let estimated_fee = dry_run.finalize.fee_receipt.total_fees_charged();
-    let adjusted_fee = estimated_fee * FEE_MARGIN_MULTIPLIER;
-    println!("  dry-run fee: {estimated_fee}, adjusted: {adjusted_fee}");
 
     // `build` asks the authorizer for the stealth authorization signatures its inputs require
     // (committing to the seal signer's one-time public key) and seals the transaction.

@@ -157,6 +157,54 @@ mod stv_tests {
     use ranked_voting::stv::run_stv;
 
     #[test]
+    fn test_stv_transfer_only_top_active_ballots() {
+        // 3 candidates, 2 winners. Round 1: 0 = 40_000 >= quota 16_667, elected with surplus
+        // 23_333. The four [0,1,2] ballots (top active choice 0) are scaled to 5833, but the
+        // [2,1,0] ballot's top active choice (2) is still active, so it must keep full weight.
+        // Round 2 (per the pre-removal active set): 1 = 4 * 5833 = 23_332, 2 = 10_000.
+        let ballots = vec![
+            ballot(&[0, 1, 2]),
+            ballot(&[0, 1, 2]),
+            ballot(&[0, 1, 2]),
+            ballot(&[0, 1, 2]),
+            ballot(&[2, 1, 0]),
+        ];
+        let (winners, rounds) = run_stv(&ballots, 3, 2);
+        assert_eq!(winners, vec![0, 1]);
+        assert_eq!(rounds[0].elected, vec![0]);
+        // Round 2: the [2,1,0] ballot still carries its full weight to candidate 2, proving
+        // the surplus transfer did not touch it (the buggy transfer scales it to 5833).
+        assert_eq!(rounds[1].counts.get(&1), Some(&23_332));
+        assert_eq!(rounds[1].counts.get(&2), Some(&10_000));
+    }
+
+    #[test]
+    fn test_stv_surplus_transfer_does_not_shift_winners() {
+        // Regression: scaling ballots that never ranked the elected candidate as top active
+        // choice can change the elected set. 4 candidates, 2 winners:
+        //   Round 1: 2 = 30_000 >= quota 23_334, elected; surplus 6_666 scales the three
+        //     [2,1,3,0] ballots to 2222 each, others keep 10_000.
+        //   Round 2: 0 = 20_000, 1 = 16_666, 3 = 10_000 — no quota (23_334); 3 eliminated.
+        //   Round 3: 0 = 30_000 >= quota; elected. Winners: [2, 0].
+        // The buggy transfer (every ballot scaled every time) instead elects 1 in round 2
+        // and returns [2, 1].
+        let ballots = vec![
+            ballot(&[2, 1, 3, 0]),
+            ballot(&[2, 1, 3, 0]),
+            ballot(&[2, 1, 3, 0]),
+            ballot(&[0, 2, 3, 1]),
+            ballot(&[0, 1, 2, 3]),
+            ballot(&[3, 0, 1, 2]),
+            ballot(&[1, 2, 3, 0]),
+        ];
+        let (winners, rounds) = run_stv(&ballots, 4, 2);
+        assert_eq!(winners, vec![2, 0]);
+        assert_eq!(rounds[0].elected, vec![2]);
+        assert_eq!(rounds[1].eliminated, Some(3));
+        assert_eq!(rounds[2].elected, vec![0]);
+    }
+
+    #[test]
     fn test_stv_two_winners_three_candidates() {
         let ballots = vec![
             ballot(&[0, 1, 2, 3]),
