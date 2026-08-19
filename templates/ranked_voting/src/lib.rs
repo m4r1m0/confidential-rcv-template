@@ -567,7 +567,10 @@ pub mod ranked_voting {
         ///   ballot tokens. After expiration, `end_vote_expired()` finalizes the tally with
         ///   whatever ballots were cast.
         /// - `mint_statement`: Built off-chain by the initiator's wallet. Must carry exactly
-        ///   `voter_count` as its revealed input amount and one stealth output per voter.
+        ///   `voter_count` as its revealed input amount and exactly `voter_count` stealth
+        ///   outputs, one per voter — both asserted below. Individual output amounts are
+        ///   confidential (Pedersen commitments), so they cannot be verified here; the
+        ///   cast-time `amount == 1` guard is the enforcement point for per-ballot value.
         ///
         /// The caller of `new` is the initiator: before the deadline only they may end the vote;
         /// after the deadline anyone may finalize it. No template fields need to be edited before
@@ -595,6 +598,12 @@ pub mod ranked_voting {
                 mint_statement.revealed_input_amount(),
                 Amount::from(voter_count),
                 "mint statement revealed input must equal voter_count",
+            );
+            // One stealth output per voter (see the `mint_statement` doc comment above).
+            assert_eq!(
+                mint_statement.stealth_outputs().len() as u64,
+                voter_count,
+                "mint statement must create one stealth output per voter",
             );
             // A multi-winner method can only be used if this build compiled it in. The
             // `SequentialIrv` variant always exists (so `MultiWinnerMethod` is never empty), but
