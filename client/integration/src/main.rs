@@ -146,20 +146,33 @@ async fn create_and_initiate_vote(
     let mut mint_builder =
         StealthTransfer::new(placeholder_resource, provider).spend_revealed_input(voter_count);
     for address in voter_addresses {
-        mint_builder = mint_builder.to_stealth_output(Output::new(
+        let mut ballot_output = Output::new(
             address.clone(),
             placeholder_resource,
             NonZeroU64::new(1).expect("non-zero"),
-        ));
+        );
+        // The template requires every ballot output to promise at least one token; the engine's
+        // range proof then pins the committed value to exactly 1 (given the total and output
+        // count, see `new`). The promise is public and reveals only that the ballot is ≥1 — every
+        // ballot is exactly 1 by design, so no additional information is disclosed.
+        ballot_output.minimum_value_promise = 1;
+        mint_builder = mint_builder.to_stealth_output(ballot_output);
     }
     let (mint_statement, _) = mint_builder.prepare().await?;
 
-    // The template asserts the same invariant at construction; check it here so a misconfigured
+    // The template asserts the same invariants at construction; check them here so a misconfigured
     // builder fails fast before submitting an unrecoverable node transaction.
     assert_eq!(
         mint_statement.stealth_outputs().len() as u64,
         voter_count,
         "mint statement must create one stealth output per voter",
+    );
+    assert!(
+        mint_statement
+            .stealth_outputs()
+            .iter()
+            .all(|utxo| utxo.output.minimum_value_promise >= 1),
+        "each ballot output must promise a minimum value of 1",
     );
 
     // Capture each voter's (commitment, nonce) from the mint statement so voters can
