@@ -7,21 +7,23 @@ use tari_template_lib::types::access_rules::{
 };
 use tari_template_lib::types::constants::TARI_TOKEN;
 use tari_template_test_tooling::TemplateTest;
-use tari_template_test_tooling::crypto::RistrettoSecretKey;
+use tari_template_test_tooling::byte_type::ToByteType;
+use tari_template_test_tooling::crypto::{PublicKey, RistrettoPublicKey, RistrettoSecretKey};
 use tari_template_test_tooling::engine_types::virtual_substate::{
     VirtualSubstate, VirtualSubstateId,
 };
 use tari_template_test_tooling::support::assert_error::assert_reject_reason;
 use tari_template_test_tooling::support::stealth::{
-    StealthSecretTransferData, generate_mint_statement, generate_stealth_output_statement,
-    generate_transfer_data,
+    StealthSecretTransferData, generate_transfer_data, test_sender_public_nonce,
 };
-use tari_template_test_tooling::template_lib_types::stealth::{
-    StealthInputsStatement, StealthTransferStatement,
+use tari_template_test_tooling::template_lib_types::{
+    EncryptedData,
+    crypto::UtxoTag,
+    stealth::SpendAuthorization,
 };
 use tari_template_test_tooling::transaction::{Transaction, args};
-use tari_template_test_tooling::wallet_crypto::MaskAndValue;
-use tari_template_test_tooling::wallet_crypto::balance_proof::generate_stealth_balance_proof_signature;
+use tari_template_test_tooling::wallet_crypto::{MaskAndValue, OutputWitness, StealthOutputWitness};
+use tari_template_test_tooling::wallet_crypto::stealth::create_transfer_statement;
 
 /// Helper: ballot `[a, b, c]` means a=1st choice, b=2nd, c=3rd.
 fn ballot(rank: &[u32]) -> Vec<u32> {
@@ -452,26 +454,68 @@ mod sequential_irv_tests {
 // These test the template's assertion guards directly using tari_template_test_tooling
 // (in-process, no testnet needed). They cover the adversarial cases from review feedback:
 // wrong token type while the vote is active, expired election, vote closed after
-// finalization, mint statements with an output-count mismatch, ballot amounts other than
-// one token (the cast-time residual), nonsense parameters, and invalid rankings (wrong
-// length / out-of-range candidate / duplicate candidate).
+// finalization, mint statements with an output-count mismatch, wrong-valued ballot shapes
+// (e.g. [2,0] — now rejected at construction by the per-output minimum-value-promise
+// assert), nonsense parameters, and invalid rankings (wrong length / out-of-range candidate /
+// duplicate candidate).
 //
 // Each test creates the component with the vote parameters in one `call_function("new", ...)`
 // call. Tests that check invalid parameters assert on the constructor itself; tests that need a
 // valid component use `create_vote` with valid params then exercise the post-creation methods.
 
-/// Builds the mint statement for `voter_count` amount-1 ballot UTXOs. The returned data keeps
-/// each UTXO's mask so tests can spend the UTXOs later (each ballot UTXO is a key-path output
-/// whose spend key is its mask).
+/// Builds the mint statement for `voter_count` amount-1 ballot UTXOs, each promising a minimum
+/// value of 1 (the invariant `new` enforces). The returned data keeps each UTXO's mask so tests
+/// can spend the UTXOs later (each ballot UTXO is a key-path output whose spend key is its mask).
 fn mint_ballots(voter_count: u64) -> StealthSecretTransferData {
-    let output_amounts: Vec<u64> = (0..voter_count).map(|_| 1).collect();
-    mint_ballots_with_amounts(output_amounts)
+    let outputs: Vec<(u64, u64)> = (0..voter_count).map(|_| (1, 1)).collect();
+    mint_ballots_with_outputs(outputs)
 }
 
-/// Like `mint_ballots`, but with the given per-output amounts. The returned data keeps each
-/// UTXO's mask so tests can spend the UTXOs later.
+/// Like `mint_ballots`, but with the given per-output amounts (each with a value-1 minimum
+/// promise). The returned data keeps each UTXO's mask so tests can spend the UTXOs later.
 fn mint_ballots_with_amounts(output_amounts: Vec<u64>) -> StealthSecretTransferData {
-    generate_mint_statement(output_amounts, 0u64, None)
+    mint_ballots_with_outputs(output_amounts.iter().map(|&amount| (amount, 1)).collect())
+}
+
+/// Builds a mint statement with the given `(amount, minimum_value_promise)` pairs for the output
+/// set, mirroring the tooling's `generate_mint_statement` but with explicit per-output promises
+/// (the tooling hardcodes promise 0). The returned data keeps each UTXO's mask so tests can spend
+/// the UTXOs later.
+fn mint_ballots_with_outputs(outputs: Vec<(u64, u64)>) -> StealthSecretTransferData {
+    let masks: Vec<RistrettoSecretKey> =
+        (0..outputs.len()).map(|i| RistrettoSecretKey::from(i as u64 + 1)).collect();
+    let output_statements: Vec<StealthOutputWitness> = outputs
+        .iter()
+        .zip(&masks)
+        .map(|((amount, promise), mask)| StealthOutputWitness {
+            witness: OutputWitness {
+                amount: *amount,
+                mask: mask.clone(),
+                sender_public_nonce: test_sender_public_nonce(),
+                minimum_value_promise: *promise,
+                encrypted_data: EncryptedData::try_from(vec![0; EncryptedData::min_size()])
+                    .expect("valid encrypted data"),
+                resource_view_key: None,
+            },
+            auth: SpendAuthorization::Key(RistrettoPublicKey::from_secret_key(mask).to_byte_type()),
+            tag: UtxoTag::new(0),
+        })
+        .collect();
+
+    let total: u64 = outputs.iter().map(|(amount, _)| amount).sum();
+    let statement = create_transfer_statement(
+        std::iter::empty(),
+        Amount::from(total),
+        output_statements.iter(),
+        Amount::zero(),
+    )
+    .expect("valid transfer statement");
+
+    StealthSecretTransferData {
+        output_masks: masks,
+        output_auths: vec![],
+        statement,
+    }
 }
 
 /// Creates a RankedVote component with the given parameters and returns
@@ -788,45 +832,17 @@ fn rejects_output_count_mismatch() {
 }
 
 #[test]
-fn rejects_ballot_must_be_exactly_one_token() {
+fn rejects_zero_value_ballot_shapes_at_construction() {
     let mut test = TemplateTest::my_crate();
     let template_address = test.get_template_address("RankedVote");
     let (_account, _proof, secret) = test.create_funded_account();
 
-    // The residual case the constructor cannot close: ballot amounts are confidential (Pedersen
-    // commitments), so a statement with the right TOTAL and the right OUTPUT COUNT can still
-    // carry a wrong-valued ballot — here [2,0] with voter_count 2 (total 2 == 2, 2 outputs).
-    // The standard tooling cannot build it (zero-amount outputs are filtered out) and the
-    // canonical wallet cannot (amounts are NonZeroU64), so the statement is constructed by
-    // hand below with a valid balance proof; the cast-time guard is the enforcement point
-    // this test targets.
-    let (outputs_statement, masks) = generate_stealth_output_statement(vec![2u64, 0u64], 0u64);
-    let agg_output_mask = masks
-        .iter()
-        .fold(RistrettoSecretKey::default(), |agg, mask| agg + mask);
-    let inputs_statement = StealthInputsStatement {
-        inputs: vec![],
-        revealed_amount: Amount::from(2u64),
-    };
-    let balance_proof = generate_stealth_balance_proof_signature(
-        &RistrettoSecretKey::default(),
-        &agg_output_mask,
-        &inputs_statement,
-        &outputs_statement,
-    );
-    let ballot_mint = StealthSecretTransferData {
-        output_masks: masks,
-        output_auths: vec![],
-        statement: StealthTransferStatement {
-            inputs_statement,
-            outputs_statement,
-            balance_proof: Some(balance_proof),
-            covenant_claims: vec![],
-        },
-    };
-
-    // The vote is created manually so the mint statement (and each output's mask) is available
-    // for the spend below.
+    // [2,0] with voter_count 2 has the right TOTAL (2) and the right OUTPUT COUNT (2), so it
+    // passes the total and count asserts. A value-0 output can only ever be proven with a
+    // minimum-value promise of 0 (any higher promise breaks the engine's range proof), so the
+    // per-output promise assert in `new` fires at construction. The old cast-time amount guard
+    // is therefore unreachable for wrong-valued ballots: no such ballot can exist.
+    let bad_mint = mint_ballots_with_outputs(vec![(2u64, 1u64), (0u64, 0u64)]);
     let transaction = test
         .transaction()
         .allocate_resource_address("ballot_res")
@@ -840,52 +856,35 @@ fn rejects_ballot_must_be_exactly_one_token() {
                 1u32,
                 MultiWinnerMethod::SequentialIrv,
                 1000u64,
-                ballot_mint.statement,
+                bad_mint.statement,
             ],
         )
         .build_and_seal(&secret);
-    let result = test.execute_expect_success(transaction, vec![]);
-    let component = result
-        .finalize
-        .result
-        .accept()
-        .unwrap()
-        .up_iter()
-        .find_map(|(id, _)| id.as_component_address())
-        .expect("component address");
-    let ballot_resource = test
-        .read_only_state_store()
-        .get_all_resources()
-        .expect("resources")
-        .into_iter()
-        .find(|(address, resource)| resource.resource_type().is_stealth() && *address != TARI_TOKEN)
-        .map(|(address, _)| address)
-        .expect("ballot resource");
-
-    // Spend the 2-token ballot UTXO into `cast_ballot` with a valid ranking. The resource
-    // check passes (it is a ballot token); the amount assert fires.
-    let ballot_spend = generate_transfer_data(
-        [MaskAndValue {
-            mask: ballot_mint.output_masks[0].clone(),
-            value: 2,
-        }],
-        0u64,
-        Vec::<u64>::new(),
-        2u64,
-    );
-    let transaction = Transaction::builder_localnet()
-        .stealth_transfer(ballot_resource, ballot_spend.statement)
-        .put_last_instruction_output_on_workspace("vote")
-        .call_method(
-            component,
-            "cast_ballot",
-            args![Workspace("vote"), vec![0u32, 1u32]],
-        )
-        .finish()
-        .add_signer(&test.to_public_key_bytes(), &ballot_mint.output_masks[0])
-        .seal(test.secret_key());
     let reject = test.execute_expect_failure(transaction, vec![]);
-    assert_reject_reason(reject, "each ballot must be exactly one token");
+    assert_reject_reason(reject, "each ballot output must promise a minimum value of 1");
+
+    // A [3,0,0] shape with voter_count 3 is rejected by the same assert: only the 3-token output
+    // can promise its value, both 0-value outputs must promise 0.
+    let bad_mint = mint_ballots_with_outputs(vec![(3u64, 1u64), (0u64, 0u64), (0u64, 0u64)]);
+    let transaction = test
+        .transaction()
+        .allocate_resource_address("ballot_res")
+        .call_function(
+            template_address,
+            "new",
+            args![
+                Workspace("ballot_res"),
+                3u64,
+                2u32,
+                1u32,
+                MultiWinnerMethod::SequentialIrv,
+                1000u64,
+                bad_mint.statement,
+            ],
+        )
+        .build_and_seal(&secret);
+    let reject = test.execute_expect_failure(transaction, vec![]);
+    assert_reject_reason(reject, "each ballot output must promise a minimum value of 1");
 }
 
 #[test]

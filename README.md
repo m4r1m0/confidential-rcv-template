@@ -24,7 +24,7 @@ This is consistent with the sibling template's model: voter *anonymity* is prote
 
 ### Double-vote prevention
 
-Each voter receives exactly one indivisible amount-1 stealth token. A stealth UTXO can only be spent once — the engine enforces this at the consensus level. There is no way to split the token or spend it twice.
+Each voter receives exactly one indivisible amount-1 stealth token; the mint-statement invariants (below) force every ballot to be exactly one token at construction. A stealth UTXO can only be spent once — the engine enforces this at the consensus level — so a 1-token ballot cannot be split or cast twice.
 
 ### Ballot supply cap (no extra ballots)
 
@@ -39,7 +39,7 @@ The cap is verifiable by anyone: `voter_count()` returns the number of ballots m
 
 ### Mint-statement invariants
 
-`new()` verifies two things about the mint statement it receives: its revealed input total equals `voter_count`, and it creates exactly `voter_count` stealth outputs — one per voter. Individual ballot amounts are confidential (each sits inside a Pedersen commitment), so per-output amounts cannot be verified on-chain; with the total and output-count checks together, a statement buildable by the canonical client or standard tooling is forced to be one amount-1 ballot per voter. A ballot that is not exactly one token can never be cast (the `cast_ballot` amount guard) and can never be burned or transferred. The mint statement is a public argument of the initiating transaction, so scrutineers can audit exactly what was minted and to which addresses.
+`new()` verifies three things about the mint statement it receives: its revealed input total equals `voter_count`, it creates exactly `voter_count` stealth outputs — one per voter — and every output promises a minimum value of at least one token. Each output's promise is public, and the engine's range-proof verification binds the output's committed value to be at least its promise; with `voter_count` outputs of at least one token each that sum to exactly `voter_count`, every ballot is forced to be exactly one token at construction. Wrong-valued shapes like `[2,0]` (a 2-token ballot plus a worthless 0-token output) are therefore unconstructible: a 0-value output can only ever be proven with a promise of 0, which the constructor rejects. Ballots can never be burned (`burnable` is `deny_all`), and no further ballots can be minted after the vote starts (see the supply cap above). The mint statement is a public argument of the initiating transaction, so scrutineers can audit exactly what was minted and to which addresses.
 
 One limitation cannot be fixed in the template: nothing on-chain can verify that the minted outputs are distributed to *distinct* voters (two amount-1 ballots could be addressed to the same person, leaving another voter with none). Voter identity and ballot assignment are off-chain; the initiating transaction's public mint statement is the audit point for that.
 

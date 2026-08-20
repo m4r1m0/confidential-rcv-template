@@ -425,8 +425,9 @@ pub mod sequential_irv {
 /// stored ballots, so the outcome is trustless — any validator or off-chain reader computes the
 /// same winner.
 ///
-/// Double-voting is impossible: each voter receives exactly one indivisible amount-1 token, and a
-/// stealth UTXO can only be spent once.
+/// Double-voting is impossible: the mint statement's per-output minimum-value promises (asserted
+/// in `new` and bound by the engine's range proof) pin every ballot to exactly one token at
+/// construction, and a stealth UTXO can only be spent once.
 ///
 /// The ballot supply is also permanently capped: minting ballot tokens requires a proof of a
 /// one-of NFT badge that is sealed inside the component at construction. After the vote starts,
@@ -574,9 +575,12 @@ pub mod ranked_voting {
         ///   whatever ballots were cast.
         /// - `mint_statement`: Built off-chain by the initiator's wallet. Must carry exactly
         ///   `voter_count` as its revealed input amount and exactly `voter_count` stealth
-        ///   outputs, one per voter — both asserted below. Individual output amounts are
-        ///   confidential (Pedersen commitments), so they cannot be verified here; the
-        ///   cast-time `amount == 1` guard is the enforcement point for per-ballot value.
+        ///   outputs, one per voter — both asserted below — and each output must promise a
+        ///   minimum value of at least one token (also asserted below). Because the engine's
+        ///   range proof binds every committed output value to be at least its promise, the
+        ///   total, output-count, and per-output promise checks together force every ballot to
+        ///   be exactly one token at construction; the cast-time `amount == 1` guard remains
+        ///   as defense in depth.
         ///
         /// The caller of `new` is the initiator: before the deadline only they may end the vote;
         /// after the deadline anyone may finalize it. No template fields need to be edited before
@@ -611,6 +615,18 @@ pub mod ranked_voting {
                 voter_count,
                 "mint statement must create one stealth output per voter",
             );
+            // Every output must promise a minimum value of one token. Each output's promise is
+            // public and the engine's range-proof verification binds the output's committed value
+            // to be at least its promise. So with `voter_count` outputs of at least one token each
+            // that sum to exactly `voter_count`, no output can hold zero or more than one token:
+            // every ballot is exactly one token at construction. The cast-time `amount == 1`
+            // guard remains as defense in depth.
+            for output in mint_statement.stealth_outputs() {
+                assert!(
+                    output.output.minimum_value_promise >= 1,
+                    "each ballot output must promise a minimum value of 1",
+                );
+            }
             // A multi-winner method can only be used if this build compiled it in. The
             // `SequentialIrv` variant always exists (so `MultiWinnerMethod` is never empty), but
             // it requires the `sequential-irv` feature; the failure is a runtime abort here
