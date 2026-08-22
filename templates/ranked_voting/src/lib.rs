@@ -44,7 +44,8 @@ pub mod irv {
     /// for elimination are broken by lowest candidate id, so all validators agree on the outcome.
     ///
     /// Returns `(winner, rounds)` where `winner` is `Some(candidate_id)` or `None`, and `rounds`
-    /// is the per-round tally trace.
+    /// is the per-round tally trace. An election with no continuing ballots (e.g. zero turnout)
+    /// has no winner: returns `None` rather than crowning a candidate by elimination tie-breaks.
     pub fn run_irv(ballots: &[Vec<u32>], num_candidates: u32) -> (Option<u32>, Vec<Round>) {
         let mut active: BTreeSet<u32> = (0..num_candidates).collect();
         let mut rounds: Vec<Round> = Vec::new();
@@ -63,14 +64,22 @@ pub mod irv {
                 }
             }
 
+            // No continuing ballots (e.g. zero turnout): nobody voted, so there is no winner.
+            // Return before the elimination tie-breaks could crown an arbitrary candidate.
+            if total == 0 {
+                rounds.push(Round {
+                    counts,
+                    eliminated: None,
+                });
+                return (None, rounds);
+            }
+
             // Majority: strictly more than half of continuing ballots.
             let mut majority_winner: Option<u32> = None;
-            if total > 0 {
-                for (&c, &v) in &counts {
-                    if v * 2 > total {
-                        majority_winner = Some(c);
-                        break;
-                    }
+            for (&c, &v) in &counts {
+                if v * 2 > total {
+                    majority_winner = Some(c);
+                    break;
                 }
             }
             if let Some(w) = majority_winner {
@@ -81,7 +90,8 @@ pub mod irv {
                 return (Some(w), rounds);
             }
 
-            // If only one active candidate remains, they win (even with zero continuing ballots).
+            // If only one active candidate remains, they win (the zero-ballots case already
+            // returned `None` above).
             if active.len() <= 1 {
                 rounds.push(Round {
                     counts,
@@ -157,6 +167,9 @@ pub mod stv {
     ///    next preference.
     /// 5. Repeat until all seats are filled or all remaining candidates fill the remaining seats.
     ///
+    /// An election with no continuing ballots (e.g. zero turnout) elects nobody: the count stops
+    /// with only the candidates elected so far (none on a fresh tally).
+    ///
     /// Deterministic: all validators agree on the outcome.
     pub fn run_stv(
         ballots: &[Vec<u32>],
@@ -205,13 +218,16 @@ pub mod stv {
                 }
             }
 
+            // No continuing ballots (e.g. zero turnout): stop without electing anyone. Without
+            // this, the quota below computes to 0 and every candidate would satisfy it.
+            if total_continuing == 0 {
+                break;
+            }
+
             // Droop quota: floor(continuing / (seats + 1)) + 1, in scaled units.
             let remaining_seats = num_winners as u64 - elected.len() as u64;
-            let quota = if total_continuing > 0 {
-                total_continuing / (remaining_seats + 1) + 1
-            } else {
-                0
-            };
+            // total_continuing > 0 here (zero-turnout already broke out above).
+            let quota = total_continuing / (remaining_seats + 1) + 1;
 
             // Check for candidates reaching the quota.
             let newly_elected: Vec<u32> = active
@@ -649,10 +665,13 @@ pub mod ranked_voting {
             // the ballot mint inside this constructor only. The badge's mint/burn/recall rules
             // are deny_all with locked updaters (no second badge can ever exist, and the sole
             // copy can never be destroyed or recalled); its withdraw rule must stay allow_all
-            // because creating the constructor's proof is authorized by it — but the rule is
-            // inert after construction, since transactions cannot address vaults directly and no
-            // template method ever exposes `mint_badge_vault`. The ballot resource is ownerless,
-            // so the ballot supply is permanently capped at `voter_count`.
+            // because creating the constructor's proof is authorized under it (the engine checks
+            // `BucketAction::CreateProof` against the Withdraw access rule) — but the rule is
+            // inert after construction: the transaction instruction set has no instruction that
+            // targets a vault address (see the `Instruction` enum in `tari_ootle_transaction`),
+            // so vaults are reachable only from within their owning component's method code,
+            // and no template method ever exposes `mint_badge_vault`. The ballot resource is
+            // ownerless, so the ballot supply is permanently capped at `voter_count`.
             let badge_bucket = ResourceBuilder::non_fungible()
                 .with_token_symbol("RVOTE-MINT")
                 .with_owner_rule(OwnerRule::None)

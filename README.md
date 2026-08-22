@@ -31,7 +31,7 @@ Each voter receives exactly one indivisible amount-1 stealth token; the mint-sta
 The ballot supply is permanently capped at the initial `voter_count`; nobody — including the initiator — can mint additional ballots after the vote starts. The ballot resource's mint rule requires a proof of a **one-of NFT badge** ("RVOTE-MINT") that is created and sealed inside the component during `new()`:
 
 - The badge's own mint/burn/recall rules are `deny_all` with locked updaters, so no second badge can ever exist and the sole copy can never be destroyed or recalled.
-- The badge lives in a component vault that no template method exposes, and transactions cannot address vaults directly, so its proof can never be re-obtained.
+- The badge lives in a component vault that no template method exposes, so its proof can never be re-obtained. (Transactions cannot reach a vault directly: the transaction instruction set has no instruction that targets a vault address — see the `Instruction` enum in `tari_ootle_transaction` — so vaults are only reachable from within their owning component's method code.)
 - The ballot resource is **ownerless** (`OwnerRule::None`), closing the resource-owner authorization path that would otherwise bypass the mint rule.
 - The mint rule's updater is `LOCKED`, so the rule itself can never be changed.
 
