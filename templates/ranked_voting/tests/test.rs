@@ -103,9 +103,13 @@ fn test_all_eliminated_until_one_remains() {
 
 #[test]
 fn test_no_ballots() {
+    // Zero turnout: nobody voted, so there must be no winner — the elimination tie-breaks
+    // must not crown an arbitrary candidate. This is the behavior `end_vote_expired` relies on
+    // when an election expires with zero ballots cast.
     let (winner, rounds) = run_irv(&[], 3);
-    assert_eq!(winner, Some(2));
-    assert!(rounds.len() >= 2);
+    assert_eq!(winner, None);
+    assert_eq!(rounds.len(), 1);
+    assert!(rounds[0].eliminated.is_none());
 }
 
 #[test]
@@ -305,6 +309,15 @@ mod stv_tests {
         assert_eq!(winners1, winners2);
         assert_eq!(rounds1.len(), rounds2.len());
     }
+
+    #[test]
+    fn test_stv_no_ballots() {
+        // Zero turnout: nobody voted, so nobody is elected. (Without the zero-turnout guard,
+        // the Droop quota computes to 0 and every candidate would satisfy `count >= quota`.)
+        let (winners, rounds) = run_stv(&[], 3, 2);
+        assert!(winners.is_empty());
+        assert!(rounds.is_empty());
+    }
 }
 
 // ─────────────────── Sequential IRV unit tests ───────────────────
@@ -414,6 +427,16 @@ mod sequential_irv_tests {
             assert_eq!(seat_a.winner, seat_b.winner);
             assert_eq!(seat_a.irv_rounds.len(), seat_b.irv_rounds.len());
         }
+    }
+
+    #[test]
+    fn test_sequential_irv_no_ballots() {
+        // Zero turnout: seat 1's IRV returns no winner, so the sequential tally stops with no
+        // winners elected.
+        let (winners, seats) = run_sequential_irv(&[], 3, 2);
+        assert!(winners.is_empty());
+        assert_eq!(seats.len(), 1);
+        assert!(seats[0].winner.is_none());
     }
 
     #[test]
