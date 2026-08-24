@@ -121,8 +121,10 @@ The initiator is whoever called `new()` — no keys need to be edited before pub
 ## Project layout
 
 ```
-templates/ranked_voting/         The template (Rust → WASM)
-  src/lib.rs                     Template + pure IRV (pub mod irv) + STV (pub mod stv, `stv` feature) + sequential IRV (pub mod sequential_irv, `sequential-irv` feature)
+tally/                           Pure tally algorithms (standalone crate `rcv-tally`)
+  src/lib.rs                     IRV (always) + STV (`stv` feature) + sequential IRV (`sequential-irv` feature); no template ABI dependency
+templates/ranked_voting/         The template (Rust → WASM, pure cdylib)
+  src/lib.rs                     Template; re-exports MultiWinnerMethod; wraps tally outputs into ABI result types
   tests/test.rs                  Unit + adversarial + end-to-end in-process tests (feature-dependent, 40 with defaults)
 client/integration/             3-voter end-to-end test on the Esmeralda testnet (IRV with redistribution; for primary testing see tests/test.rs, which covers the same scenario in-process)
 ```
@@ -148,10 +150,16 @@ voters. The default build includes everything:
 
 | Build command | Included methods | WASM size |
 |---|---|---|
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting` (default) | IRV + sequential IRV + STV | ~368 KB → ~309 KB (minified) |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features` | IRV only | ~342 KB → ~286 KB (minified) |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features stv` | IRV + STV | ~352 KB → ~295 KB (minified) |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features sequential-irv` | IRV + sequential IRV | ~360 KB → ~302 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting` (default) | IRV + sequential IRV + STV | ~287 KB → ~248 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features` | IRV only | ~261 KB → ~226 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features stv` | IRV + STV | ~272 KB → ~235 KB (minified) |
+| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features sequential-irv` | IRV + sequential IRV | ~277 KB → ~240 KB (minified) |
+
+The pure tally algorithms live in the standalone `tally/` crate (`rcv-tally`); the template
+depends on it and ships as a **pure `cdylib`**. This matters for size: with a second
+crate-type (`rlib`) present, rustc silently drops `-C lto`, and the WASM grows by roughly 20%
+(~314 KB vs ~248 KB minified). Tests link `rcv-tally` directly, so keeping `rlib` out costs no
+test coverage.
 
 "Minified" is the raw release build run through `wasm-opt -Oz` (see below); exact sizes are
 printed by `scripts/minify-wasm.sh`, which fails the run if the minified default build

@@ -6,6 +6,10 @@ description = "Confidential ranked-choice voting template for Tari Ootle (IRV, s
 
 [dependencies]
 tari_template_lib = { version = "0.29" }
+# The pure tally algorithms live in a standalone crate so the template can ship as a pure
+# cdylib: with a second crate-type (rlib) present, rustc silently drops `-C lto` and the
+# WASM grows ~20%. Tests link `rcv-tally` directly instead of this crate.
+rcv-tally = { path = "../../tally", default-features = false }
 
 [dev-dependencies]
 tari_template_test_tooling = "0.38"
@@ -16,11 +20,12 @@ tari_template_test_tooling = "0.38"
 #   --no-default-features                     single-winner IRV only
 #   --no-default-features --features stv      IRV + STV
 #   --no-default-features --features sequential-irv   IRV + sequential IRV
+# Features forward to `rcv-tally`, which contains the actual tally implementations.
 # The multi-winner method is still pinned per contract via `MultiWinnerMethod` in `new()`.
 [features]
 default = ["sequential-irv", "stv"]
-sequential-irv = []
-stv = []
+sequential-irv = ["rcv-tally/sequential-irv"]
+stv = ["rcv-tally/stv"]
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]

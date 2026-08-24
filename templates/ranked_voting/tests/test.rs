@@ -1,5 +1,5 @@
-use ranked_voting::MultiWinnerMethod;
-use ranked_voting::irv::run_irv;
+use rcv_tally::MultiWinnerMethod;
+use rcv_tally::irv::run_irv;
 use tari_template_lib::prelude::Amount;
 use tari_template_lib::types::SubstateOwnerRule;
 use tari_template_lib::types::access_rules::{
@@ -159,8 +159,8 @@ fn test_determinism_same_result() {
 #[cfg(feature = "stv")]
 mod stv_tests {
     use super::ballot;
-    use ranked_voting::irv::run_irv;
-    use ranked_voting::stv::run_stv;
+    use rcv_tally::irv::run_irv;
+    use rcv_tally::stv::run_stv;
 
     #[test]
     fn test_stv_transfer_only_top_active_ballots() {
@@ -327,8 +327,8 @@ mod stv_tests {
 #[cfg(feature = "sequential-irv")]
 mod sequential_irv_tests {
     use super::ballot;
-    use ranked_voting::irv::run_irv;
-    use ranked_voting::sequential_irv::run_sequential_irv;
+    use rcv_tally::irv::run_irv;
+    use rcv_tally::sequential_irv::run_sequential_irv;
 
     #[test]
     fn test_sequential_irv_two_winners() {

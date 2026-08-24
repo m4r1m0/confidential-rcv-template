@@ -26,14 +26,14 @@ use ootle_rs::{
     transaction::TransactionSigner,
     wallet::OotleWallet,
 };
-use ranked_voting::MultiWinnerMethod;
+use rcv_tally::MultiWinnerMethod;
 use std::num::NonZeroU64;
 use std::time::Duration;
 use tari_crypto::ristretto::RistrettoPublicKey;
 use tari_ootle_transaction::args;
 
 // Publish the minified artifact produced by `scripts/minify-wasm.sh` (the default build,
-// with the full method set) — ~309 KB after wasm-opt -Oz vs ~368 KB raw.
+// with the full method set) — ~248 KB after wasm-opt -Oz vs ~287 KB raw.
 const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm";
 const VOTER_COUNT: usize = 3;
 const NUM_CANDIDATES: u32 = 3;
