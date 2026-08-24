@@ -17,7 +17,7 @@ A confidential ranked-choice voting template for the Tari Ootle L2 platform. Vot
 
 ## Privacy model
 
-This template inherits the **coinjoin-style blending** design from the sibling yes/no template (obscure *who sent what ballot*, not the ballot content):
+This template inherits the **coinjoin-style blending** design from the sibling yes/no [confidential voting template](https://github.com/m4r1m0/confidential-voting-template) (obscure *who sent what ballot*, not the ballot content):
 
 1. **Initiator mints stealth ballot tokens.** When a vote is initiated, the template mints one indivisible amount-1 ballot token per eligible voter and converts them into **stealth UTXOs** — each owned by a one-time key unlinkable to the voter's real public key. The stealth outputs are built off-chain by the initiator's wallet and passed to the template as a `StealthTransferStatement`. The supply is permanently capped at `voter_count` (see [Ballot supply cap](#ballot-supply-cap-no-extra-ballots)).
 
@@ -33,7 +33,7 @@ This template inherits the **coinjoin-style blending** design from the sibling y
 | | Number of ballots cast |
 | | The IRV winner and per-round tallies |
 
-This is consistent with the sibling template's model: voter *anonymity* is protected by stealth-address unlinkability; ballot *content* (the ranking) is visible on-chain. The ranking must be public for the on-chain IRV computation to be trustless.
+This is consistent with the [sibling template](https://github.com/m4r1m0/confidential-voting-template)'s model: voter *anonymity* is protected by stealth-address unlinkability; ballot *content* (the ranking) is visible on-chain. The ranking must be public for the on-chain IRV computation to be trustless.
 
 ### Double-vote prevention
 
@@ -75,6 +75,8 @@ The single-winner tally uses **instant-runoff voting (IRV)**:
 3. Otherwise, **eliminate** the candidate with the fewest votes. Ties are broken by **lowest candidate id** (deterministic, so all validators agree).
 4. Repeat until a winner is found or only one candidate remains.
 
+If no ballots were cast, there is no winner: the tally returns `None` rather than electing anyone through elimination tie-breaks.
+
 Each ballot is a permutation of `0..num_candidates`, where `ranking[0]` is the voter's first choice, `ranking[1]` their second, and so on. When a voter's top candidate is eliminated, their ballot redistributes to their next-highest-ranked still-active candidate.
 
 The `result()` method is read-only (`&self`) and deterministic, so the outcome is trustless — no trusted tally authority is needed.
@@ -113,7 +115,7 @@ For those who prefer proportional representation, the template also supports **s
 
 Elections have an `expires_at_epoch` deadline set at initiation. After the deadline, no more ballots may be cast (`cast_ballot` checks `Consensus::current_epoch()`). This prevents an election from being held up indefinitely by voters who never spend their stealth ballot tokens.
 
-After expiration, `end_vote_expired()` finalizes the tally with whatever ballots were actually cast. It is callable by anyone, so the election cannot be held up by an initiator who never returns; the initiator can also use it.
+After expiration, `end_vote_expired()` finalizes the tally with whatever ballots were actually cast. It is callable by anyone, so the election cannot be held up by an initiator who never returns; the initiator can also use it. A zero-turnout election (deadline reached, no ballots cast) elects nobody.
 
 ## Template API
 
