@@ -38,9 +38,7 @@ pub use rcv_tally::MultiWinnerMethod;
 #[template]
 pub mod ranked_voting {
     use rcv_tally::irv::run_irv;
-    #[cfg(feature = "sequential-irv")]
     use rcv_tally::sequential_irv::run_sequential_irv;
-    #[cfg(feature = "stv")]
     use rcv_tally::stv::run_stv;
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
@@ -78,17 +76,14 @@ pub mod ranked_voting {
     ///
     /// The variant is fixed by the election's configuration: `num_winners == 1` always yields
     /// `Irv`, and multi-winner elections yield whichever variant the `MultiWinnerMethod` chosen
-    /// at initialization produces. Which multi-winner variants exist mirrors the
-    /// `MultiWinnerMethod` enum and therefore the cargo features.
+    /// at initialization produces.
     #[derive(Clone, Debug)]
     pub enum VoteResult {
         /// Single-winner instant-runoff result.
         Irv(IrvResult),
-        /// Sequential-IRV multi-winner result (requires the `sequential-irv` feature).
-        #[cfg(feature = "sequential-irv")]
+        /// Sequential-IRV multi-winner result.
         SequentialIrv(SequentialIrvResult),
-        /// STV multi-winner result (requires the `stv` feature).
-        #[cfg(feature = "stv")]
+        /// STV multi-winner result.
         Stv(StvResult),
     }
 
@@ -228,17 +223,6 @@ pub mod ranked_voting {
                     "each ballot output must promise a minimum value of 1",
                 );
             }
-            // A multi-winner method can only be used if this build compiled it in. The
-            // `SequentialIrv` variant always exists (so `MultiWinnerMethod` is never empty), but
-            // it requires the `sequential-irv` feature; the failure is a runtime abort here
-            // rather than a broken build. Single-winner elections (`num_winners == 1`) are
-            // unaffected — the method is ignored for them.
-            assert!(
-                num_winners == 1
-                    || !matches!(multi_winner_method, MultiWinnerMethod::SequentialIrv)
-                    || cfg!(feature = "sequential-irv"),
-                "MultiWinnerMethod::SequentialIrv requires the `sequential-irv` feature (build with `--features sequential-irv`)",
-            );
 
             // The caller of `new` is the initiator: their key gates ending the vote before the
             // deadline. Capturing the key here instead of hard-coding placeholders means nothing
@@ -420,27 +404,17 @@ pub mod ranked_voting {
             result
         }
 
-        /// Multi-winner tally via the method pinned in `new`. Which arms exist mirrors the
-        /// `MultiWinnerMethod` variants and therefore the cargo features; `new` rejects methods
-        /// whose tally logic is not compiled in.
+        /// Multi-winner tally via the method pinned in `new`.
         fn multi_winner_result(&self) -> VoteResult {
             match self.multi_winner_method {
-                #[cfg(feature = "sequential-irv")]
                 MultiWinnerMethod::SequentialIrv => {
                     VoteResult::SequentialIrv(self.sequential_irv_result())
                 }
-                #[cfg(not(feature = "sequential-irv"))]
-                MultiWinnerMethod::SequentialIrv => unreachable!(
-                    "MultiWinnerMethod::SequentialIrv requires the `sequential-irv` feature; `new` rejects it",
-                ),
-                #[cfg(feature = "stv")]
                 MultiWinnerMethod::Stv => VoteResult::Stv(self.stv_result()),
             }
         }
 
-        /// Sequential-IRV multi-winner tally (requires the `sequential-irv` feature). Emits a
-        /// `ResultMulti` event.
-        #[cfg(feature = "sequential-irv")]
+        /// Sequential-IRV multi-winner tally. Emits a `ResultMulti` event.
         fn sequential_irv_result(&self) -> SequentialIrvResult {
             let (winners, seats) =
                 run_sequential_irv(&self.ballots, self.num_candidates, self.num_winners);
@@ -469,8 +443,7 @@ pub mod ranked_voting {
             result
         }
 
-        /// STV multi-winner tally (requires the `stv` feature). Emits a `ResultStv` event.
-        #[cfg(feature = "stv")]
+        /// STV multi-winner tally. Emits a `ResultStv` event.
         fn stv_result(&self) -> StvResult {
             let (winners, rounds) = run_stv(&self.ballots, self.num_candidates, self.num_winners);
             let rounds: Vec<StvRoundTally> = rounds

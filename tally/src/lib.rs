@@ -6,9 +6,6 @@
 //! a ~20% smaller WASM (with both `cdylib` and `rlib` crate-types, rustc silently drops
 //! `-C lto`) — and (b) the algorithms carry no template ABI dependency; the template's
 //! `result()` methods wrap these outputs into ABI-compatible structs.
-//!
-//! Feature gates mirror the template's: `stv` compiles in the STV tally, `sequential-irv`
-//! compiles in sequential IRV; IRV is always available.
 
 use minicbor::{Decode, Encode};
 
@@ -24,9 +21,7 @@ pub enum MultiWinnerMethod {
     /// Fill each seat by running single-winner IRV, removing the winner, and repeating.
     #[n(0)]
     SequentialIrv,
-    /// Single transferable vote with the Droop quota (proportional representation). Requires
-    /// the `stv` feature.
-    #[cfg(feature = "stv")]
+    /// Single transferable vote with the Droop quota (proportional representation).
     #[n(1)]
     Stv,
 }
@@ -125,11 +120,6 @@ pub mod irv {
 /// Pure single-transferable-vote (STV) tally logic for multi-winner elections, isolated from the
 /// template engine so it can be unit-tested directly. Returns simple types (winners + per-round
 /// data) with no dependency on template ABI traits.
-///
-/// This module is compiled only when the `stv` feature is enabled (off by default in a
-/// `--no-default-features` build). The `stv` variant of `MultiWinnerMethod` / `VoteResult` in the
-/// template module mirrors this gate. The IRV module (`pub mod irv`) is always compiled.
-#[cfg(feature = "stv")]
 pub mod stv {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -324,15 +314,8 @@ pub mod stv {
 /// until all seats are filled. It is simpler than STV (no quotas, no surplus transfer, no
 /// fractional weights) and reuses the existing `run_irv` function directly.
 ///
-/// This is the **default multi-winner method** when `num_winners > 1`. STV remains available
-/// (with the `stv` feature) for those who prefer proportional representation, but sequential IRV
-/// is simpler and easier to audit.
-///
-/// This module is compiled only when the `sequential-irv` feature is enabled (the default; off in
-/// a `--no-default-features` build). The `SequentialIrv` variant of `MultiWinnerMethod` /
-/// `VoteResult` in the template module mirrors this gate: the variant always exists so the enum
-/// is never empty, but `new` rejects it when this module is not compiled in.
-#[cfg(feature = "sequential-irv")]
+/// This is the **default multi-winner method** when `num_winners > 1`. STV remains available for
+/// those who prefer proportional representation, but sequential IRV is simpler and easier to audit.
 pub mod sequential_irv {
     use super::irv::{Round as IrvRound, run_irv};
 

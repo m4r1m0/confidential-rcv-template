@@ -9,7 +9,3 @@ description = "Pure deterministic tally algorithms (IRV, STV, sequential IRV) fo
 # coherent between this crate and the template that re-exports it.
 minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }
 
-[features]
-default = ["sequential-irv", "stv"]
-sequential-irv = []
-stv = []
