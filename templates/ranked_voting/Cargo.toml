@@ -5,14 +5,14 @@ edition = "2024"
 description = "Confidential ranked-choice voting template for Tari Ootle (IRV, stealth ballots, unlinkable voters)"
 
 [dependencies]
-tari_template_lib = { version = "0.29" }
+tari_template_lib = { version = "0.31" }
 # The pure tally algorithms live in a standalone crate so the template can ship as a pure
 # cdylib: with a second crate-type (rlib) present, rustc silently drops `-C lto` and the
 # WASM grows ~20%. Tests link `rcv-tally` directly instead of this crate.
 rcv-tally = { path = "../../tally", default-features = false }
 
 [dev-dependencies]
-tari_template_test_tooling = "0.38"
+tari_template_test_tooling = "0.39"
 
 # Compile-time selection of the tally algorithms included in the WASM. The default build
 # ships everything; publishers who want a smaller, cheaper template can build with

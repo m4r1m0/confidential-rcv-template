@@ -21,7 +21,7 @@ use tari_template_test_tooling::template_lib_types::{
     crypto::UtxoTag,
     stealth::SpendAuthorization,
 };
-use tari_template_test_tooling::transaction::{Transaction, args};
+use tari_template_test_tooling::transaction::{Epoch, Transaction, args};
 use tari_template_test_tooling::wallet_crypto::{MaskAndValue, OutputWitness, StealthOutputWitness};
 use tari_template_test_tooling::wallet_crypto::stealth::create_transfer_statement;
 
@@ -806,7 +806,7 @@ fn rejects_invalid_ranking() {
             Vec::<u64>::new(),
             1u64,
         );
-        let transaction = Transaction::builder_localnet()
+        let transaction = Transaction::builder_localnet(Epoch(100))
             .stealth_transfer(ballot_resource, ballot_spend.statement)
             .put_last_instruction_output_on_workspace("vote")
             .call_method(component, "cast_ballot", args![Workspace("vote"), ranking])
@@ -1098,7 +1098,7 @@ fn end_to_end_three_voter_election() {
             Vec::<u64>::new(),
             1u64,
         );
-        let transaction = Transaction::builder_localnet()
+        let transaction = Transaction::builder_localnet(Epoch(100))
             .stealth_transfer(ballot_resource, ballot_spend.statement)
             .put_last_instruction_output_on_workspace("vote")
             .call_method(
@@ -1122,7 +1122,7 @@ fn end_to_end_three_voter_election() {
         Vec::<u64>::new(),
         1u64,
     );
-    let transaction = Transaction::builder_localnet()
+    let transaction = Transaction::builder_localnet(Epoch(100))
         .stealth_transfer(ballot_resource, double_spend.statement)
         .put_last_instruction_output_on_workspace("vote")
         .call_method(
