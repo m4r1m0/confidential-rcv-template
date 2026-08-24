@@ -26,14 +26,14 @@ use ootle_rs::{
     transaction::TransactionSigner,
     wallet::OotleWallet,
 };
-use ranked_voting::MultiWinnerMethod;
+use rcv_tally::MultiWinnerMethod;
 use std::num::NonZeroU64;
 use std::time::Duration;
 use tari_crypto::ristretto::RistrettoPublicKey;
-use tari_ootle_transaction::args;
+use tari_ootle_transaction::{args, Epoch};
 
 // Publish the minified artifact produced by `scripts/minify-wasm.sh` (the default build,
-// with the full method set) — ~309 KB after wasm-opt -Oz vs ~368 KB raw.
+// with the full method set) — ~248 KB after wasm-opt -Oz vs ~287 KB raw.
 const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm";
 const VOTER_COUNT: usize = 3;
 const NUM_CANDIDATES: u32 = 3;
@@ -73,9 +73,16 @@ async fn wait_for_commit(pending: &PendingTransaction, label: &str) -> Result<()
     Ok(())
 }
 
+
+/// Every transaction must carry a bounded validity window: the last epoch in which it may be
+/// sequenced. Current epoch plus a margin for confirmation time.
+async fn max_epoch(provider: &Provider) -> Result<Epoch> {
+    Ok(Epoch(provider.get_epoch().await?.as_u64() + 10))
+}
+
 async fn faucet(provider: &mut Provider, label: &str) -> Result<()> {
     print!("\n[{label}] Faucet... ");
-    let unsigned = IFaucet::new(provider)
+    let unsigned = IFaucet::new(provider, max_epoch(provider).await?)
         .take_faucet_funds()
         .pay_fee(5_000u64)
         .prepare()
@@ -96,7 +103,7 @@ const PUBLISH_FEE: u64 = 20_000_000;
 async fn publish_template(provider: &mut Provider) -> Result<TemplateAddress> {
     print!("\n[Publish] template... ");
     let wasm = std::fs::read(WASM_PATH).with_context(|| format!("read {WASM_PATH}"))?;
-    let unsigned = IAccount::new(provider)
+    let unsigned = IAccount::new(provider, max_epoch(provider).await?)
         .publish_template(wasm)
         .pay_fee(PUBLISH_FEE)
         .prepare()
@@ -192,7 +199,7 @@ async fn create_and_initiate_vote(
         .collect();
 
     // Create the component and start the vote in a single transaction.
-    let unsigned = IComponent::new(provider)
+    let unsigned = IComponent::new(provider, max_epoch(provider).await?)
         .then(|builder| builder.allocate_resource_address("ballot_res"))
         .call_function(
             template_address,
@@ -266,7 +273,7 @@ async fn convert_to_stealth_tari(
         .try_from_byte_type()
         .expect("valid tari nonce");
 
-    let unsigned = IComponent::new(provider)
+    let unsigned = IComponent::new(provider, max_epoch(provider).await?)
         .want_vault_for(voter_account, TARI_TOKEN, true)
         .then(|builder| {
             builder.with_fee_instructions_builder(|fee_builder| {
@@ -337,7 +344,7 @@ async fn cast_private_ballot(
     let signature_requirements =
         SignatureRequirements::stealth_seal_with(ballot_signer, authorizers);
 
-    let unsigned = IComponent::new(provider)
+    let unsigned = IComponent::new(provider, max_epoch(provider).await?)
         .want_all_vaults(component)
         .then(|builder| {
             builder
@@ -380,7 +387,7 @@ async fn end_vote_and_read_result(
     component: ComponentAddress,
 ) -> Result<()> {
     print!("\n[Result] end_vote()... ");
-    let unsigned = IComponent::new(provider)
+    let unsigned = IComponent::new(provider, max_epoch(provider).await?)
         .call_method(component, "end_vote", args![])
         .pay_fee(5_000u64)
         .prepare()

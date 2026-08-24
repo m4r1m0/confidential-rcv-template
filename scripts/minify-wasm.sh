@@ -28,12 +28,12 @@ if ! command -v wasm-opt >/dev/null 2>&1; then
     exit 1
 fi
 
-# Size budget (bytes) for the minified default build. Measured sizes (wasm-opt -Oz):
-#   default (all 3 methods) ~368 KB raw  -> ~309 KB minified
-#   IRV-only                 ~342 KB raw  -> ~286 KB minified
-# Review feedback expected ~250 KB for a scaffolded single-method template; the full
-# three-method bundle plus the template ABI carries the difference — per-method builds
-# (feature flags) get closest to that estimate. This gate leaves headroom for growth.
+# Size budget (bytes) for the minified default build. Measured sizes (wasm-opt -Oz), with the
+# template shipped as a pure cdylib (tally logic in the standalone rcv-tally crate, full LTO):
+#   default (all 3 methods) ~287 KB raw  -> ~248 KB minified
+#   IRV-only                 ~261 KB raw  -> ~226 KB minified
+# Review feedback estimated ~250 KB for a scaffolded single-method template; the default
+# three-method bundle now lands under that. This gate leaves headroom for growth.
 SIZE_BUDGET=320000
 
 declare -a COMBOS
