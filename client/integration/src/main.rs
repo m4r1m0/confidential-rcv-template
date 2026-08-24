@@ -32,9 +32,10 @@ use std::time::Duration;
 use tari_crypto::ristretto::RistrettoPublicKey;
 use tari_ootle_transaction::{args, Epoch};
 
-// Publish the minified artifact produced by `scripts/minify-wasm.sh` (the default build,
-// with the full method set) — ~248 KB after wasm-opt -Oz vs ~287 KB raw.
-const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm";
+// Publish the minified release build — minify it first with:
+//   wasm-opt -Oz --enable-bulk-memory target/wasm32-unknown-unknown/release/ranked_voting.wasm \
+//       -o target/wasm32-unknown-unknown/release/ranked_voting.min.wasm
+const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/ranked_voting.min.wasm";
 const VOTER_COUNT: usize = 3;
 const NUM_CANDIDATES: u32 = 3;
 const NUM_WINNERS: u32 = 1;

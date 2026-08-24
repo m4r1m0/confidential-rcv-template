@@ -1,5 +1,18 @@
 # Confidential Ranked-Choice Voting Template for Tari Ootle
 
+> ## ⚠️ Minify the WASM before you publish
+>
+> ```bash
+> cargo build --target wasm32-unknown-unknown --release -p ranked_voting
+> wasm-opt -Oz --enable-bulk-memory \
+>     target/wasm32-unknown-unknown/release/ranked_voting.wasm \
+>     -o target/wasm32-unknown-unknown/release/ranked_voting.min.wasm
+> ```
+>
+> Publish `ranked_voting.min.wasm` (~248 KB), never the raw `.wasm` (~287 KB). Publish fees
+> scale with WASM size, and every validator stores the template forever — an unminified
+> artifact costs roughly 15% more for the life of the chain.
+
 A confidential ranked-choice voting template for the Tari Ootle L2 platform. Voters cast unlinkable ranked ballots using stealth-addressed ballot tokens — no on-chain observer can link any ballot transaction to the voter who cast it. The instant-runoff (IRV) tally is computed on-chain and is trustlessly readable by anyone.
 
 ## Privacy model
@@ -122,10 +135,10 @@ The initiator is whoever called `new()` — no keys need to be edited before pub
 
 ```
 tally/                           Pure tally algorithms (standalone crate `rcv-tally`)
-  src/lib.rs                     IRV (always) + STV (`stv` feature) + sequential IRV (`sequential-irv` feature); no template ABI dependency
+  src/lib.rs                     IRV + STV + sequential IRV; no template ABI dependency
 templates/ranked_voting/         The template (Rust → WASM, pure cdylib)
   src/lib.rs                     Template; re-exports MultiWinnerMethod; wraps tally outputs into ABI result types
-  tests/test.rs                  Unit + adversarial + end-to-end in-process tests (feature-dependent, 40 with defaults)
+  tests/test.rs                  Unit + adversarial + end-to-end in-process tests (45)
 client/integration/             3-voter end-to-end test on the Esmeralda testnet (IRV with redistribution; for primary testing see tests/test.rs, which covers the same scenario in-process)
 ```
 
@@ -142,59 +155,30 @@ cargo test -p ranked_voting
 cargo build --bin integration
 ```
 
-### Build options: choosing which tally methods to include
-
-The template is compiled with **cargo features** that select which multi-winner methods are
-included in the WASM. A smaller WASM means cheaper deployments and faster code downloads for
-voters. The default build includes everything:
-
-| Build command | Included methods | WASM size |
-|---|---|---|
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting` (default) | IRV + sequential IRV + STV | ~287 KB → ~248 KB (minified) |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features` | IRV only | ~261 KB → ~226 KB (minified) |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features stv` | IRV + STV | ~272 KB → ~235 KB (minified) |
-| `cargo build --target wasm32-unknown-unknown --release -p ranked_voting --no-default-features --features sequential-irv` | IRV + sequential IRV | ~277 KB → ~240 KB (minified) |
-
-The pure tally algorithms live in the standalone `tally/` crate (`rcv-tally`); the template
-depends on it and ships as a **pure `cdylib`**. This matters for size: with a second
-crate-type (`rlib`) present, rustc silently drops `-C lto`, and the WASM grows by roughly 20%
-(~314 KB vs ~248 KB minified). Tests link `rcv-tally` directly, so keeping `rlib` out costs no
-test coverage.
-
-"Minified" is the raw release build run through `wasm-opt -Oz` (see below); exact sizes are
-printed by `scripts/minify-wasm.sh`, which fails the run if the minified default build
-exceeds 320 KB.
-
 ### Publishing
 
+Minify the release build with [wasm-opt](https://github.com/WebAssembly/binaryen) before
+publishing (see the notice at the top of this README):
+
 ```bash
-./scripts/minify-wasm.sh   # builds all 4 combos, writes *.min.wasm artifacts, prints the size table
+wasm-opt -Oz --enable-bulk-memory \
+    target/wasm32-unknown-unknown/release/ranked_voting.wasm \
+    -o target/wasm32-unknown-unknown/release/ranked_voting.min.wasm
 ```
 
-Publish the minified artifact (`target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm`
-for the default build) instead of the raw `.wasm`. The publish fee scales with WASM size —
-unused fee is refunded (see `PUBLISH_FEE` in `client/integration/src/main.rs`) — and a smaller
-artifact also downloads and instantiates faster for voters.
+Publish `target/wasm32-unknown-unknown/release/ranked_voting.min.wasm`. The publish fee
+scales with WASM size — unused fee is refunded (see `PUBLISH_FEE` in
+`client/integration/src/main.rs`) — and a smaller artifact also downloads and instantiates
+faster for voters.
 
-If you strip methods out, the component API still works exactly the same — the only difference
-is which `MultiWinnerMethod` values `new()` accepts:
-
-- With **IRV only**, create single-winner elections (`num_winners = 1`) exactly as before.
-- With **IRV + STV** (`--no-default-features --features stv`), pass `MultiWinnerMethod::Stv` for
-  multi-winner elections.
-- With **IRV + sequential IRV** (`--no-default-features --features sequential-irv`) or the
-  default build, pass `MultiWinnerMethod::SequentialIrv`.
-
-Using a method that wasn't compiled in fails immediately in `new()` with a clear error message,
-so a stripped build can never silently compute the wrong tally.
-
-The matching test command for each option uses the same feature flags, e.g.
-`cargo test -p ranked_voting --no-default-features --features stv`.
+The WASM includes all tally methods: single-winner IRV plus both multi-winner methods
+(sequential IRV and STV). Deployers pick the method per election via the `MultiWinnerMethod`
+argument of `new()`; nothing needs to be recompiled or republished to change it.
 
 ## Run the integration test
 
-First run `./scripts/minify-wasm.sh` — the client publishes the minified artifact
-(`target/wasm32-unknown-unknown/release/ranked_voting.default.min.wasm`).
+First minify the template as shown above — the client publishes the minified artifact
+(`target/wasm32-unknown-unknown/release/ranked_voting.min.wasm`).
 
 ```bash
 cargo run --bin integration

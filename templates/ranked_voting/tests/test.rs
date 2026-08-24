@@ -154,9 +154,7 @@ fn test_determinism_same_result() {
 }
 
 // ───────────────────────── STV unit tests ─────────────────────────
-// Compiled only with the `stv` feature, matching the `ranked_voting::stv` module.
 
-#[cfg(feature = "stv")]
 mod stv_tests {
     use super::ballot;
     use rcv_tally::irv::run_irv;
@@ -321,10 +319,7 @@ mod stv_tests {
 }
 
 // ─────────────────── Sequential IRV unit tests ───────────────────
-// Compiled only with the `sequential-irv` feature, matching the `ranked_voting::sequential_irv`
-// module.
 
-#[cfg(feature = "sequential-irv")]
 mod sequential_irv_tests {
     use super::ballot;
     use rcv_tally::irv::run_irv;
@@ -1035,8 +1030,8 @@ fn ballot_minting_is_permanently_revoked() {
 //
 // Mirrors the testnet scenario in `client/integration/src/main.rs` entirely in-process
 // (no testnet needed): the vote is created, each voter spends their stealth ballot UTXO
-// into `cast_ballot`, and `end_vote` produces the expected IRV winner. The test works in
-// every feature build because a single-winner election always takes the IRV path.
+// into `cast_ballot`, and `end_vote` produces the expected IRV winner. A single-winner election
+// always takes the IRV path regardless of the pinned multi-winner method.
 
 #[test]
 fn end_to_end_three_voter_election() {
@@ -1207,7 +1202,6 @@ fn single_winner_vote_always_uses_irv() {
     );
 }
 
-#[cfg(feature = "stv")]
 #[test]
 fn single_winner_vote_ignores_stv_method() {
     let topics = end_vote_topics(1, 3, 1, MultiWinnerMethod::Stv);
@@ -1221,7 +1215,6 @@ fn single_winner_vote_ignores_stv_method() {
     );
 }
 
-#[cfg(feature = "sequential-irv")]
 #[test]
 fn multi_winner_vote_dispatches_sequential_irv() {
     let topics = end_vote_topics(1, 3, 2, MultiWinnerMethod::SequentialIrv);
@@ -1231,7 +1224,6 @@ fn multi_winner_vote_dispatches_sequential_irv() {
     );
 }
 
-#[cfg(feature = "stv")]
 #[test]
 fn multi_winner_vote_dispatches_stv() {
     let topics = end_vote_topics(1, 3, 2, MultiWinnerMethod::Stv);
