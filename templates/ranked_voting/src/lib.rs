@@ -9,7 +9,6 @@ use tari_template_lib::prelude::*;
 /// it without linking an rlib of this crate.
 pub use rcv_tally::MultiWinnerMethod;
 
-///
 /// A vote instance mints one unlinkable stealth ballot-token UTXO per eligible voter (built
 /// off-chain by the initiator's wallet and passed in as a `StealthTransferStatement`). Each voter
 /// spends their UTXO into the ballot pool via `cast_ballot`, attaching a full ranking of the

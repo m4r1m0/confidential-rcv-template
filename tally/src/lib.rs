@@ -91,16 +91,6 @@ pub mod irv {
                 return (Some(w), rounds);
             }
 
-            // If only one active candidate remains, they win (the zero-ballots case already
-            // returned `None` above).
-            if active.len() <= 1 {
-                rounds.push(Round {
-                    counts,
-                    eliminated: None,
-                });
-                return (active.iter().next().copied(), rounds);
-            }
-
             // Eliminate the lowest-count candidate; ties broken by lowest id (BTreeSet order).
             let min_count = *counts.values().min().expect("non-empty active set");
             let to_eliminate = active
@@ -229,7 +219,13 @@ pub mod stv {
             let newly_elected: Vec<u32> = active
                 .iter()
                 .copied()
-                .filter(|&candidate| counts.get(&candidate).copied().unwrap_or(0) >= quota)
+                .filter(|&candidate| {
+                    counts
+                        .get(&candidate)
+                        .copied()
+                        .expect("active candidate counted")
+                        >= quota
+                })
                 .collect();
 
             if !newly_elected.is_empty() {
@@ -249,8 +245,11 @@ pub mod stv {
                 // pre-removal set) are scaled by surplus / count (the transfer fraction);
                 // ballots whose top preference is still-active candidates keep their weight.
                 for &candidate in &newly_elected {
-                    let candidate_count = counts.get(&candidate).copied().unwrap_or(0);
-                    if candidate_count == 0 || quota == 0 {
+                    let candidate_count = counts
+                        .get(&candidate)
+                        .copied()
+                        .expect("newly elected candidate counted");
+                    if candidate_count == 0 {
                         continue;
                     }
                     let surplus = candidate_count - quota;
@@ -281,11 +280,17 @@ pub mod stv {
 
             // No candidate reached quota — eliminate the lowest-count candidate.
             // Ties broken by lowest candidate id (BTreeSet iteration order).
-            let min_count = counts.values().min().copied().unwrap_or(0);
+            let min_count = *counts.values().min().expect("non-empty active set");
             let to_eliminate = active
                 .iter()
                 .copied()
-                .find(|candidate| counts.get(candidate).copied().unwrap_or(0) == min_count)
+                .find(|candidate| {
+                    counts
+                        .get(candidate)
+                        .copied()
+                        .expect("active candidate counted")
+                        == min_count
+                })
                 .expect("an elimination candidate exists when active set is non-empty");
 
             active.remove(&to_eliminate);
@@ -346,7 +351,7 @@ pub mod sequential_irv {
         let mut winners: Vec<u32> = Vec::new();
         let mut seats: Vec<Seat> = Vec::new();
 
-        let mut current_ballots: Vec<Vec<u32>> = ballots.iter().map(|b| b.to_vec()).collect();
+        let mut current_ballots: Vec<Vec<u32>> = ballots.to_vec();
 
         for _seat_index in 0..num_winners {
             // Candidates still in contention: everyone except those already elected.
