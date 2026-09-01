@@ -30,7 +30,7 @@ use rcv_tally::MultiWinnerMethod;
 use std::num::NonZeroU64;
 use std::time::Duration;
 use tari_crypto::ristretto::RistrettoPublicKey;
-use tari_ootle_transaction::{args, Epoch};
+use tari_ootle_transaction::{Epoch, args};
 
 // Publish the minified release build — minify it first with:
 //   wasm-opt -Oz --enable-bulk-memory target/wasm32-unknown-unknown/release/ranked_voting.wasm \
@@ -73,7 +73,6 @@ async fn wait_for_commit(pending: &PendingTransaction, label: &str) -> Result<()
     }
     Ok(())
 }
-
 
 /// Every transaction must carry a bounded validity window: the last epoch in which it may be
 /// sequenced. Current epoch plus a margin for confirmation time.

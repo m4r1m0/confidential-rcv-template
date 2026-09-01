@@ -1,0 +1,18 @@
+# Config for the official Tari CLI (`cargo install tari-ootle-cli`, binary `tari`).
+# Used by `tari publish` to publish the template and register its build-time
+# metadata with the community-templates metadata server so it appears on
+# https://ootle.tari.com/community-templates.
+# Run `tari publish` from this directory (the CLI discovers this file by walking up
+# from the current directory; add -y to skip the confirmation prompts). It builds the
+# WASM, registers the metadata hash on-chain, and offers to post the metadata to the
+# server. Note: `-c` is the --custom-network flag, not a config path.
+default-network = "esmeralda"
+
+[networks.localnet]
+wallet-daemon-url = "http://127.0.0.1:5100/json_rpc"
+metadata-server-url = "http://localhost:3000/"
+
+[networks.esmeralda]
+wallet-daemon-url = "http://127.0.0.1:5100/json_rpc"
+metadata-server-url = "https://ootle.tari.com/community-templates"
+template-address = "template_0965f308b3b9096ac480cde7e1de90e41bdf4a0718a5884c8318783dfb958625"

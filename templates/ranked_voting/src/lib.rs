@@ -9,8 +9,6 @@ use tari_template_lib::prelude::*;
 /// it without linking an rlib of this crate.
 pub use rcv_tally::MultiWinnerMethod;
 
-
-///
 /// A vote instance mints one unlinkable stealth ballot-token UTXO per eligible voter (built
 /// off-chain by the initiator's wallet and passed in as a `StealthTransferStatement`). Each voter
 /// spends their UTXO into the ballot pool via `cast_ballot`, attaching a full ranking of the
@@ -37,10 +35,10 @@ pub use rcv_tally::MultiWinnerMethod;
 /// bypass the mint rule either.
 #[template]
 pub mod ranked_voting {
+    use super::*;
     use rcv_tally::irv::run_irv;
     use rcv_tally::sequential_irv::run_sequential_irv;
     use rcv_tally::stv::run_stv;
-    use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
     pub struct RankedVote {

@@ -17,13 +17,13 @@ use tari_template_test_tooling::support::stealth::{
     StealthSecretTransferData, generate_transfer_data, test_sender_public_nonce,
 };
 use tari_template_test_tooling::template_lib_types::{
-    EncryptedData,
-    crypto::UtxoTag,
-    stealth::SpendAuthorization,
+    EncryptedData, crypto::UtxoTag, stealth::SpendAuthorization,
 };
 use tari_template_test_tooling::transaction::{Epoch, Transaction, args};
-use tari_template_test_tooling::wallet_crypto::{MaskAndValue, OutputWitness, StealthOutputWitness};
 use tari_template_test_tooling::wallet_crypto::stealth::create_transfer_statement;
+use tari_template_test_tooling::wallet_crypto::{
+    MaskAndValue, OutputWitness, StealthOutputWitness,
+};
 
 /// Helper: ballot `[a, b, c]` means a=1st choice, b=2nd, c=3rd.
 fn ballot(rank: &[u32]) -> Vec<u32> {
@@ -500,8 +500,9 @@ fn mint_ballots_with_amounts(output_amounts: Vec<u64>) -> StealthSecretTransferD
 /// (the tooling hardcodes promise 0). The returned data keeps each UTXO's mask so tests can spend
 /// the UTXOs later.
 fn mint_ballots_with_outputs(outputs: Vec<(u64, u64)>) -> StealthSecretTransferData {
-    let masks: Vec<RistrettoSecretKey> =
-        (0..outputs.len()).map(|i| RistrettoSecretKey::from(i as u64 + 1)).collect();
+    let masks: Vec<RistrettoSecretKey> = (0..outputs.len())
+        .map(|i| RistrettoSecretKey::from(i as u64 + 1))
+        .collect();
     let output_statements: Vec<StealthOutputWitness> = outputs
         .iter()
         .zip(&masks)
@@ -879,7 +880,10 @@ fn rejects_zero_value_ballot_shapes_at_construction() {
         )
         .build_and_seal(&secret);
     let reject = test.execute_expect_failure(transaction, vec![]);
-    assert_reject_reason(reject, "each ballot output must promise a minimum value of 1");
+    assert_reject_reason(
+        reject,
+        "each ballot output must promise a minimum value of 1",
+    );
 
     // A [3,0,0] shape with voter_count 3 is rejected by the same assert: only the 3-token output
     // can promise its value, both 0-value outputs must promise 0.
@@ -902,7 +906,10 @@ fn rejects_zero_value_ballot_shapes_at_construction() {
         )
         .build_and_seal(&secret);
     let reject = test.execute_expect_failure(transaction, vec![]);
-    assert_reject_reason(reject, "each ballot output must promise a minimum value of 1");
+    assert_reject_reason(
+        reject,
+        "each ballot output must promise a minimum value of 1",
+    );
 }
 
 #[test]
