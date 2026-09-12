@@ -155,6 +155,11 @@ cargo test -p ranked_voting
 
 # Build the integration test client
 cargo build --bin integration
+
+> **wasmer pin:** `cargo test` needs `wasmer = "=7.3.0"` (pinned in
+> `templates/ranked_voting/Cargo.toml`): `tari_engine` declares `wasmer ^7.1.0`, but
+> wasmer 7.4.0 removed an API the engine uses. Remove the pins once tari-ootle
+> tightens its wasmer constraint.
 ```
 
 ### Publishing
