@@ -135,7 +135,7 @@ async fn create_and_initiate_vote(
     provider: &mut Provider,
     template_address: TemplateAddress,
     voter_addresses: &[Address],
-) -> Result<(ComponentAddress, ResourceAddress)> {
+) -> Result<(ComponentAddress, ResourceAddress, Epoch)> {
     print!("\n[Create + Initiate] vote... ");
     let voter_count = voter_addresses.len() as u64;
 
@@ -228,8 +228,12 @@ async fn create_and_initiate_vote(
         .and_then(|event| event.substate_id())
         .and_then(|s| s.as_resource_address())
         .context("no ballot resource addr")?;
+    // The ballot outputs were created by this transaction, so its commit epoch is the exact
+    // lower bound for any later scan of the resource: every ballot's row carries `epoch >=
+    // initiate_epoch`, and the bound keeps the scan's history walk limited to the election.
+    let initiate_epoch = receipt.epoch;
     println!("  component: {component}\n  ballot resource: {ballot_resource}");
-    Ok((component, ballot_resource))
+    Ok((component, ballot_resource, initiate_epoch))
 }
 
 /// Discover a voter's own ballot UTXO by scanning the ballot resource's unspent stealth
@@ -241,11 +245,16 @@ async fn create_and_initiate_vote(
 /// data's MAC validates), so a voter finds exactly their own ballot and learns nothing about
 /// anyone else's. The commitment and sender public nonce are both public output fields — no
 /// secret material is involved.
+///
+/// `from_epoch` bounds the scan to the resource's history since the vote's initiation epoch —
+/// the ballot outputs were created then, so the full output set is covered without walking the
+/// resource's pre-election history.
 async fn find_my_ballot_utxo(
     provider: &Provider,
     voter_address: &Address,
     view_secret: &RistrettoSecretKey,
     ballot_resource: ResourceAddress,
+    from_epoch: Epoch,
 ) -> Result<(PedersenCommitmentBytes, RistrettoPublicKey)> {
     // Drain the resource's UTXO update stream pass by pass, advancing the per-shard resume
     // cursor from each `EndOfShard` watermark. A single pass covers only a subset of shards, so
@@ -258,7 +267,7 @@ async fn find_my_ballot_utxo(
     while observed.len() < total_shards {
         let request = StealthUtxoWatchRequest {
             resource_address: ballot_resource,
-            from_epoch: Epoch(0),
+            from_epoch,
             shard_state_versions: cursor.to_pairs(),
             unspent_only: true,
             per_shard_limit: 1000,
@@ -508,7 +517,7 @@ async fn main() -> Result<()> {
         .collect();
     let voter_addresses: Vec<Address> = voter_wallets.iter().map(|(_, a, _)| a.clone()).collect();
 
-    let (component, ballot_resource) =
+    let (component, ballot_resource, initiate_epoch) =
         create_and_initiate_vote(&mut initiator_provider, template_address, &voter_addresses)
             .await?;
 
@@ -525,12 +534,14 @@ async fn main() -> Result<()> {
             .await?;
 
         // The voter discovers their own ballot UTXO by scanning the ballot resource — the
-        // initiator sends nothing back after the vote is created.
+        // initiator sends nothing back after the vote is created. The scan is bounded to the
+        // resource's history since the initiate transaction's commit epoch.
         let (ballot_commitment, ballot_nonce) = find_my_ballot_utxo(
             &voter_provider,
             &voter_address,
             &view_secret,
             ballot_resource,
+            initiate_epoch,
         )
         .await?;
         println!(
