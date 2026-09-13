@@ -31,7 +31,7 @@ use ootle_rs::{
     transaction::TransactionSigner,
     wallet::OotleWallet,
 };
-use rcv_tally::MultiWinnerMethod;
+use rcv_tally::TallyMethod;
 use std::num::NonZeroU64;
 use std::time::Duration;
 use tari_crypto::ristretto::{RistrettoPublicKey, RistrettoSecretKey};
@@ -63,6 +63,20 @@ const VOTE_FEE: u64 = 50_000;
 const VOTER_RANKINGS: [[u32; NUM_CANDIDATES as usize]; VOTER_COUNT] =
     [[0, 2, 1], [1, 2, 0], [2, 0, 1]];
 const EXPECTED_WINNER: u32 = 2;
+
+// ───────────────────────── FPTP yes/no scenario ─────────────────────────
+// A first-past-the-post election with exactly two candidates is functionally a yes/no vote:
+// candidate 0 = "yes", candidate 1 = "no". The tally counts first preferences only — the
+// candidate with the most votes wins, with no majority required.
+
+const FPTP_VOTER_COUNT: usize = 3;
+const FPTP_NUM_CANDIDATES: u32 = 2;
+const FPTP_NUM_WINNERS: u32 = 1;
+/// Each voter's choice as a full ranking of the two candidates: [0, 1] = "yes", [1, 0] = "no".
+/// Two "yes" votes vs one "no" → candidate 0 ("yes") wins 2-1.
+const FPTP_VOTER_CHOICES: [[u32; FPTP_NUM_CANDIDATES as usize]; FPTP_VOTER_COUNT] =
+    [[0, 1], [0, 1], [1, 0]];
+const FPTP_EXPECTED_WINNER: u32 = 0;
 
 type Provider = IndexerProvider<OotleWallet>;
 
@@ -135,6 +149,9 @@ async fn create_and_initiate_vote(
     provider: &mut Provider,
     template_address: TemplateAddress,
     voter_addresses: &[Address],
+    num_candidates: u32,
+    num_winners: u32,
+    tally_method: TallyMethod,
 ) -> Result<(ComponentAddress, ResourceAddress, Epoch)> {
     print!("\n[Create + Initiate] vote... ");
     let voter_count = voter_addresses.len() as u64;
@@ -192,9 +209,9 @@ async fn create_and_initiate_vote(
             args![
                 Workspace("ballot_res"),
                 voter_count,
-                NUM_CANDIDATES,
-                NUM_WINNERS,
-                MultiWinnerMethod::SequentialIrv,
+                num_candidates,
+                num_winners,
+                tally_method,
                 EXPIRES_AT_EPOCH,
                 mint_statement,
             ],
@@ -468,7 +485,7 @@ async fn cast_private_ballot(
 async fn end_vote_and_read_result(
     provider: &mut Provider,
     component: ComponentAddress,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     print!("\n[Result] end_vote()... ");
     let unsigned = IComponent::new(provider, max_epoch(provider).await?)
         .call_method(component, "end_vote", args![])
@@ -482,31 +499,34 @@ async fn end_vote_and_read_result(
     let pending = provider.send_transaction(tx).await?;
     wait_for_commit(&pending, "end_vote").await?;
     let receipt = pending.get_receipt().await?;
+    let mut winner = None;
     for event in receipt.events.iter() {
         println!("  event: {} {{{}}}", event.topic(), event.payload());
+        // The tally events (`Result`, `ResultFptp`, ...) carry the winner under `winner`.
+        if let Some(w) = event.get_payload("winner") {
+            winner = w.parse::<u32>().ok();
+        }
     }
-    Ok(())
+    Ok(winner)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Runs one election end-to-end: creates fresh voter wallets, initiates the vote with the given
+/// configuration, has each voter discover their ballot UTXO and cast privately, then ends the
+/// vote and returns the winner from the tally event.
+#[allow(clippy::too_many_arguments)]
+async fn run_election(
+    initiator_provider: &mut Provider,
+    template_address: TemplateAddress,
+    voter_count: usize,
+    num_candidates: u32,
+    num_winners: u32,
+    tally_method: TallyMethod,
+    ballots: &[Vec<u32>],
+    label: &str,
+) -> Result<Option<u32>> {
     let network = Network::Esmeralda;
 
-    let init_secret = PrivateKeyProvider::random(network);
-    let init_address = init_secret.address().clone();
-    let init_wallet = OotleWallet::from(init_secret);
-    println!("Initiator: {init_address}");
-
-    let mut initiator_provider = ProviderBuilder::new()
-        .wallet(init_wallet)
-        .connect_with_transaction_timeout(default_indexer_url(network), Duration::from_secs(120))
-        .await?;
-    println!("Connected to indexer");
-
-    faucet(&mut initiator_provider, "Initiator").await?;
-    let template_address = publish_template(&mut initiator_provider).await?;
-
-    let voter_wallets: Vec<(OotleWallet, Address, RistrettoSecretKey)> = (0..VOTER_COUNT)
+    let voter_wallets: Vec<(OotleWallet, Address, RistrettoSecretKey)> = (0..voter_count)
         .map(|i| {
             let secret = PrivateKeyProvider::random(network);
             let address = secret.address().clone();
@@ -517,13 +537,18 @@ async fn main() -> Result<()> {
         .collect();
     let voter_addresses: Vec<Address> = voter_wallets.iter().map(|(_, a, _)| a.clone()).collect();
 
-    let (component, ballot_resource, initiate_epoch) =
-        create_and_initiate_vote(&mut initiator_provider, template_address, &voter_addresses)
-            .await?;
+    let (component, ballot_resource, initiate_epoch) = create_and_initiate_vote(
+        initiator_provider,
+        template_address,
+        &voter_addresses,
+        num_candidates,
+        num_winners,
+        tally_method,
+    )
+    .await?;
 
     for (i, (wallet, voter_address, view_secret)) in voter_wallets.into_iter().enumerate() {
-        let ranking = VOTER_RANKINGS[i].to_vec();
-        println!("\n[Voter {i}] cast ballot ranking={ranking:?}");
+        println!("\n[Voter {i}] cast ballot ranking={:?}", ballots[i]);
 
         let mut voter_provider = ProviderBuilder::new()
             .wallet(wallet)
@@ -561,15 +586,80 @@ async fn main() -> Result<()> {
             ballot_nonce,
             tari_commitment,
             tari_nonce,
-            ranking,
+            ballots[i].clone(),
         )
         .await?;
     }
 
-    end_vote_and_read_result(&mut initiator_provider, component).await?;
+    println!("\n[{label}] finalizing...");
+    end_vote_and_read_result(initiator_provider, component).await
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let network = Network::Esmeralda;
+
+    let init_secret = PrivateKeyProvider::random(network);
+    let init_address = init_secret.address().clone();
+    let init_wallet = OotleWallet::from(init_secret);
+    println!("Initiator: {init_address}");
+
+    let mut initiator_provider = ProviderBuilder::new()
+        .wallet(init_wallet)
+        .connect_with_transaction_timeout(default_indexer_url(network), Duration::from_secs(120))
+        .await?;
+    println!("Connected to indexer");
+
+    faucet(&mut initiator_provider, "Initiator").await?;
+    let template_address = publish_template(&mut initiator_provider).await?;
+
+    // Election 1: ranked-choice IRV (3 voters, 3 candidates, 1 winner).
+    println!("\n=== Election 1: ranked-choice IRV ===");
+    let irv_winner = run_election(
+        &mut initiator_provider,
+        template_address,
+        VOTER_COUNT,
+        NUM_CANDIDATES,
+        NUM_WINNERS,
+        TallyMethod::SequentialIrv,
+        &VOTER_RANKINGS
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>(),
+        "IRV",
+    )
+    .await?;
+    assert_eq!(
+        irv_winner,
+        Some(EXPECTED_WINNER),
+        "IRV election produced the wrong winner: {irv_winner:?}",
+    );
+
+    // Election 2: FPTP yes/no vote (3 voters, 2 candidates = "yes"/"no", 1 winner).
+    println!("\n=== Election 2: FPTP yes/no ===");
+    let fptp_winner = run_election(
+        &mut initiator_provider,
+        template_address,
+        FPTP_VOTER_COUNT,
+        FPTP_NUM_CANDIDATES,
+        FPTP_NUM_WINNERS,
+        TallyMethod::Fptp,
+        &FPTP_VOTER_CHOICES
+            .iter()
+            .map(|r| r.to_vec())
+            .collect::<Vec<_>>(),
+        "FPTP yes/no",
+    )
+    .await?;
+    assert_eq!(
+        fptp_winner,
+        Some(FPTP_EXPECTED_WINNER),
+        "FPTP election produced the wrong winner: {fptp_winner:?}",
+    );
 
     println!(
-        "\nINTEGRATION COMPLETE: 3-voter ranked-choice IRV vote validated (expected winner = candidate {EXPECTED_WINNER})."
+        "\nINTEGRATION COMPLETE: IRV validated (winner = candidate {EXPECTED_WINNER}) and \
+         FPTP yes/no validated (winner = candidate {FPTP_EXPECTED_WINNER})."
     );
     Ok(())
 }
