@@ -3,7 +3,8 @@
 //! Runs a full 3-voter ranked-choice scenario on the Esmeralda testnet. For primary testing,
 //! see `templates/ranked_voting/tests/test.rs` (in-process, no testnet needed).
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use indexmap::IndexSet;
 use ootle_byte_type::FromByteType;
 use ootle_rs::{
@@ -14,14 +15,18 @@ use ootle_rs::{
         component::{IComponent, TransactionBuildable},
         faucet::IFaucet,
     },
+    crypto::{StealthCryptoApi, encrypted_data},
     default_indexer_url,
     key_provider::PrivateKeyProvider,
-    provider::{IndexerProvider, PendingTransaction, ProviderBuilder, WalletProvider},
+    provider::{
+        IndexerProvider, PendingTransaction, ProviderBuilder, ShardCursor, StealthUtxoFrame,
+        StealthUtxoWatchRequest, WalletProvider,
+    },
     stealth::{Output, SignatureRequirements, StealthSignerRequirement, StealthTransfer},
     template_types::{
         Amount, ComponentAddress, ResourceAddress, TemplateAddress, UtxoAddress,
         constants::{TARI, TARI_TOKEN},
-        crypto::PedersenCommitmentBytes,
+        crypto::{PedersenCommitmentBytes, RistrettoPublicKeyBytes, UtxoTag},
     },
     transaction::TransactionSigner,
     wallet::OotleWallet,
@@ -29,7 +34,7 @@ use ootle_rs::{
 use rcv_tally::MultiWinnerMethod;
 use std::num::NonZeroU64;
 use std::time::Duration;
-use tari_crypto::ristretto::RistrettoPublicKey;
+use tari_crypto::ristretto::{RistrettoPublicKey, RistrettoSecretKey};
 use tari_ootle_transaction::{Epoch, args};
 
 // Publish the minified release build — minify it first with:
@@ -130,11 +135,7 @@ async fn create_and_initiate_vote(
     provider: &mut Provider,
     template_address: TemplateAddress,
     voter_addresses: &[Address],
-) -> Result<(
-    ComponentAddress,
-    ResourceAddress,
-    Vec<(PedersenCommitmentBytes, RistrettoPublicKey)>,
-)> {
+) -> Result<(ComponentAddress, ResourceAddress)> {
     print!("\n[Create + Initiate] vote... ");
     let voter_count = voter_addresses.len() as u64;
 
@@ -182,22 +183,6 @@ async fn create_and_initiate_vote(
         "each ballot output must promise a minimum value of 1",
     );
 
-    // Capture each voter's (commitment, nonce) from the mint statement so voters can
-    // spend their UTXOs later.
-    let ballot_utxos: Vec<(PedersenCommitmentBytes, RistrettoPublicKey)> = mint_statement
-        .stealth_outputs()
-        .iter()
-        .map(|utxo| {
-            let commitment = *utxo.commitment();
-            let nonce: RistrettoPublicKey = utxo
-                .output
-                .sender_public_nonce
-                .try_from_byte_type()
-                .expect("valid nonce");
-            (commitment, nonce)
-        })
-        .collect();
-
     // Create the component and start the vote in a single transaction.
     let unsigned = IComponent::new(provider, max_epoch(provider).await?)
         .then(|builder| builder.allocate_resource_address("ballot_res"))
@@ -244,7 +229,96 @@ async fn create_and_initiate_vote(
         .and_then(|s| s.as_resource_address())
         .context("no ballot resource addr")?;
     println!("  component: {component}\n  ballot resource: {ballot_resource}");
-    Ok((component, ballot_resource, ballot_utxos))
+    Ok((component, ballot_resource))
+}
+
+/// Discover a voter's own ballot UTXO by scanning the ballot resource's unspent stealth
+/// outputs, instead of receiving the (commitment, nonce) from the initiator.
+///
+/// The indexer enumerates a resource's unspent UTXOs publicly as `(tag, sender public nonce)`
+/// fetch keys; resolving them yields each output's commitment and DH-encrypted data. Only the
+/// output addressed to this voter decrypts with the voter's view-only key (the encrypted
+/// data's MAC validates), so a voter finds exactly their own ballot and learns nothing about
+/// anyone else's. The commitment and sender public nonce are both public output fields — no
+/// secret material is involved.
+async fn find_my_ballot_utxo(
+    provider: &Provider,
+    voter_address: &Address,
+    view_secret: &RistrettoSecretKey,
+    ballot_resource: ResourceAddress,
+) -> Result<(PedersenCommitmentBytes, RistrettoPublicKey)> {
+    // Drain the resource's UTXO update stream pass by pass, advancing the per-shard resume
+    // cursor from each `EndOfShard` watermark. A single pass covers only a subset of shards, so
+    // keep polling until every shard has been drained.
+    let num_preshards = provider.get_num_preshards().await?;
+    let mut cursor = ShardCursor::genesis(num_preshards);
+    let mut observed = std::collections::HashSet::new();
+    let total_shards = num_preshards.all_shards_iter().count();
+    let mut fetch_keys: Vec<(UtxoTag, RistrettoPublicKeyBytes)> = Vec::new();
+    while observed.len() < total_shards {
+        let request = StealthUtxoWatchRequest {
+            resource_address: ballot_resource,
+            from_epoch: Epoch(0),
+            shard_state_versions: cursor.to_pairs(),
+            unspent_only: true,
+            per_shard_limit: 1000,
+        };
+        let mut stream = Box::pin(provider.watch_stealth_utxos(request).into_stream());
+        let mut pass_progress = false;
+        while let Some(frame) = stream.next().await {
+            match frame.context("failed to watch ballot resource UTXOs")? {
+                StealthUtxoFrame::Unspent { tag, public_nonce } => {
+                    fetch_keys.push((tag, public_nonce))
+                }
+                StealthUtxoFrame::EndOfShard {
+                    shard,
+                    max_state_version,
+                } => {
+                    observed.insert(shard);
+                    cursor.observe(shard, max_state_version);
+                    pass_progress = true;
+                }
+                // `unspent_only` suppresses Spent/Burnt frames; StartOfShard carries no data.
+                StealthUtxoFrame::StartOfShard { .. }
+                | StealthUtxoFrame::Spent { .. }
+                | StealthUtxoFrame::Burnt { .. } => {}
+            }
+        }
+        // A pass that returns no shard at all means there is nothing left to drain.
+        if !pass_progress {
+            break;
+        }
+    }
+
+    let crypto_api = StealthCryptoApi::new();
+    for (id, utxo) in provider
+        .fetch_unspent_utxos(ballot_resource, &fetch_keys)
+        .await?
+    {
+        let commitment = id.into_commitment_bytes();
+        let output = utxo
+            .output()
+            .context("ballot UTXO has been burnt since enumeration")?;
+        let public_nonce: RistrettoPublicKey = output
+            .output
+            .public_nonce
+            .try_from_byte_type()
+            .expect("valid sender public nonce");
+        let encryption_key = crypto_api.derive_encrypted_data_key(&public_nonce, view_secret);
+        // Decryption validates the encrypted data's MAC: it succeeds only for the output
+        // addressed to `view_secret`'s owner.
+        if encrypted_data::unblind_output(
+            &commitment,
+            &output.output.encrypted_data,
+            &encryption_key,
+            true,
+        )
+        .is_ok()
+        {
+            return Ok((commitment, public_nonce));
+        }
+    }
+    bail!("no unspent ballot UTXO owned by {voter_address} on resource {ballot_resource}")
 }
 
 async fn convert_to_stealth_tari(
@@ -423,32 +497,24 @@ async fn main() -> Result<()> {
     faucet(&mut initiator_provider, "Initiator").await?;
     let template_address = publish_template(&mut initiator_provider).await?;
 
-    let voter_wallets: Vec<(OotleWallet, Address)> = (0..VOTER_COUNT)
+    let voter_wallets: Vec<(OotleWallet, Address, RistrettoSecretKey)> = (0..VOTER_COUNT)
         .map(|i| {
             let secret = PrivateKeyProvider::random(network);
             let address = secret.address().clone();
+            let view_secret = secret.credentials().view_only_secret().clone();
             println!("  voter {i} address: {address}");
-            (OotleWallet::from(secret), address)
+            (OotleWallet::from(secret), address, view_secret)
         })
         .collect();
-    let voter_addresses: Vec<Address> = voter_wallets.iter().map(|(_, a)| a.clone()).collect();
+    let voter_addresses: Vec<Address> = voter_wallets.iter().map(|(_, a, _)| a.clone()).collect();
 
-    let (component, ballot_resource, ballot_utxos) =
+    let (component, ballot_resource) =
         create_and_initiate_vote(&mut initiator_provider, template_address, &voter_addresses)
             .await?;
 
-    for (i, (commitment, _)) in ballot_utxos.iter().enumerate() {
-        println!(
-            "  voter {i} ballot UTXO commitment: {}",
-            hex::encode(commitment)
-        );
-    }
-
-    for (i, (wallet, voter_address)) in voter_wallets.into_iter().enumerate() {
+    for (i, (wallet, voter_address, view_secret)) in voter_wallets.into_iter().enumerate() {
         let ranking = VOTER_RANKINGS[i].to_vec();
         println!("\n[Voter {i}] cast ballot ranking={ranking:?}");
-
-        let (ballot_commitment, ballot_nonce) = &ballot_utxos[i];
 
         let mut voter_provider = ProviderBuilder::new()
             .wallet(wallet)
@@ -458,6 +524,20 @@ async fn main() -> Result<()> {
             )
             .await?;
 
+        // The voter discovers their own ballot UTXO by scanning the ballot resource — the
+        // initiator sends nothing back after the vote is created.
+        let (ballot_commitment, ballot_nonce) = find_my_ballot_utxo(
+            &voter_provider,
+            &voter_address,
+            &view_secret,
+            ballot_resource,
+        )
+        .await?;
+        println!(
+            "  found own ballot UTXO: {}",
+            hex::encode(ballot_commitment)
+        );
+
         faucet(&mut voter_provider, &format!("Voter {i}")).await?;
         let (tari_commitment, tari_nonce) =
             convert_to_stealth_tari(&mut voter_provider, &voter_address).await?;
@@ -466,8 +546,8 @@ async fn main() -> Result<()> {
             component,
             ballot_resource,
             &voter_address,
-            *ballot_commitment,
-            ballot_nonce.clone(),
+            ballot_commitment,
+            ballot_nonce,
             tari_commitment,
             tari_nonce,
             ranking,

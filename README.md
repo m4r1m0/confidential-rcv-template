@@ -21,7 +21,7 @@ This template inherits the **coinjoin-style blending** design from the sibling y
 
 1. **Initiator mints stealth ballot tokens.** When a vote is initiated, the template mints one indivisible amount-1 ballot token per eligible voter and converts them into **stealth UTXOs** — each owned by a one-time key unlinkable to the voter's real public key. The stealth outputs are built off-chain by the initiator's wallet and passed to the template as a `StealthTransferStatement`. The supply is permanently capped at `voter_count` (see [Ballot supply cap](#ballot-supply-cap-no-extra-ballots)).
 
-2. **Voters spend privately.** Each voter spends their stealth ballot-token UTXO via `cast_ballot`, attaching their full ranking of the candidates. Because the spend is a **stealth transfer sealed with an ephemeral one-time key** (with the transaction fee paid from a separate stealth TARI UTXO), no on-chain observer can link the ballot transaction to a voter identity. The `cast_ballot` method deliberately never calls `CallerContext::transaction_signer_public_key()` so that ephemeral sealing works.
+2. **Voters spend privately.** Each voter spends their stealth ballot-token UTXO via `cast_ballot`, attaching their full ranking of the candidates. Voters discover their own ballot UTXO by scanning the ballot resource's unspent outputs — the initiator sends nothing back after initiation (see [Voter UTXO discovery](#voter-utxo-discovery)). Because the spend is a **stealth transfer sealed with an ephemeral one-time key** (with the transaction fee paid from a separate stealth TARI UTXO), no on-chain observer can link the ballot transaction to a voter identity. The `cast_ballot` method deliberately never calls `CallerContext::transaction_signer_public_key()` so that ephemeral sealing works.
 
 3. **Tally is public, on-chain, and trustless.** Anyone can call `result()` to compute the outcome from the stored ballots: instant-runoff for single-winner elections, or the multi-winner method chosen at initiation (see below). The computation is deterministic, so every validator and off-chain reader agrees on the outcome.
 
@@ -65,6 +65,12 @@ Paying the fee from a revealed source breaks anonymity completely: the fee input
 The reference client in `client/integration` implements the canonical pattern in `cast_private_ballot`: a two-input stealth spend that uses the ballot-token UTXO as the seal input and a stealth TARI UTXO as the fee input, both bound to the same ephemeral one-time key. Wallet code that builds ballot transactions should follow that pattern exactly — the template cannot enforce it (it never sees fee inputs), so this requirement is a client-side contract.
 
 Fees paid from a bucket (`pay_fee_from_bucket`) are **non-refundable**: the engine takes the revealed fee bucket in full and burns any excess to the fee pool — there is no refund destination that could link a ballot back to a revealed account. The reference client therefore reveals a flat `VOTE_FEE` per ballot that comfortably exceeds the actual fee; the overpay is deliberately uniform so every ballot transaction reveals the same fee.
+
+### Voter UTXO discovery (scan, don't receive)
+
+Voters do not receive their ballot UTXO's `(commitment, sender nonce)` from the initiator. The indexer enumerates a resource's unspent stealth UTXOs publicly (`watch_stealth_utxos` → `fetch_unspent_utxos` in `ootle-rs`), each resolved output carrying its commitment and the sender's public nonce. Every output's encrypted data is DH-encrypted to the recipient's view-only key, so a voter finds exactly their own ballot by attempting to decrypt each candidate output — the MAC check succeeds only for the one addressed to them. No secret material is exchanged; the only out-of-band step in the whole flow is voters providing their addresses to the initiator before `new()` so the mint statement can be addressed.
+
+The reference client implements this in `find_my_ballot_utxo` (`client/integration/src/main.rs`). Like the fee-from-stealth requirement, it is a client-side contract: the template never sees UTXO commitments, and a wallet that was told its commitment instead of scanning produces a byte-identical ballot transaction.
 
 ## IRV tally algorithm (single-winner)
 
@@ -194,7 +200,7 @@ cargo run --bin integration
 This runs a full 3-voter ranked-choice scenario on the Esmeralda testnet:
 
 - Initiator wallet faucets, publishes the template, creates the component with `new(3 candidates, 1 winner, sequential IRV, mint_statement)`, minting 3 stealth ballot UTXOs (one per voter).
-- Three voter wallets each faucet, convert TARI to a stealth UTXO for fees, then cast a private ballot via a two-input stealth spend (ballot UTXO → `cast_ballot`, TARI UTXO → fee) with their ranking.
+- Three voter wallets each faucet, discover their own ballot UTXO by scanning the ballot resource, convert TARI to a stealth UTXO for fees, then cast a private ballot via a two-input stealth spend (ballot UTXO → `cast_ballot`, TARI UTXO → fee) with their ranking.
 - `end_vote()` returns the IRV result: **candidate 2 wins in 2 rounds** (no first-round majority → candidate 0 eliminated → ballot redistributes to candidate 2 → majority).
 
 ## Stealth auth signatures commit to the sealing one-time key
